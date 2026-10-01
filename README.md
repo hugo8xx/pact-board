@@ -11,6 +11,7 @@ to a human, checked on every call, narrowing at each hand-off, revocable at any 
 | `pact-board` (this repo) | the MCP server: 7 tools, mandates, the append-only hash-chained log |
 | An OAuth 2.1 authorization server | signs people in for the hosted Claude apps. Bring any that issues JWT access tokens with a JWKS and supports CIMD or DCR (Keycloak, WorkOS, Auth0, …) |
 | Agent tokens | `pact_…` bearer tokens for Claude Code, Gemini CLI, hooks and the Runner — no OAuth needed |
+| `admin/` | the Admin UI (Next.js, for Vercel). It calls the board's Admin API at `/admin/api` |
 
 Each agent has its own URL: `https://<board>/mcp/a/<agent-id>`. With OAuth, the signed-in person
 must be the agent's owner; the board matches them to a registered human by verified email once,
@@ -47,6 +48,14 @@ put the agent's URL and token in the repo's `.mcp.json`:
 `uv run pact-admin --help` lists the human-side commands (approve, resume, pause, freeze, halt,
 revoke, erase a payload, verify the log).
 
+## Admin API
+
+`/admin/api/*` is for people, not agents: it takes an OAuth access token whose audience is
+`<PACT_PUBLIC_URL>/admin`, signed in with a second factor (`amr` contains `mfa`). Agent tokens and
+tokens minted for agent URLs are refused. Roles: owners do everything (kill switch, production
+flag, freezing, banning); approvers approve tasks, register agents and issue or revoke mandates;
+viewers read. See [`admin/`](admin/README.md) for the UI.
+
 ## Configuration
 
 | Variable | Required | Meaning |
@@ -55,6 +64,7 @@ revoke, erase a payload, verify the log).
 | `PACT_SIGNING_KEY` | yes | ≥ 32 random characters; signs mandates. Changing it invalidates every mandate |
 | `PACT_PUBLIC_URL` | yes in production | this server's public URL, e.g. `https://board.example.com` |
 | `PACT_AUTH_ISSUER` | for the hosted Claude apps | your authorization server's issuer URL; unset = agent tokens only |
+| `PACT_ADMIN_REQUIRE_MFA` | no | default `1`; set `0` only if your issuer never reports `amr` |
 | `PORT`, `HOST` | no | default `8787`, `127.0.0.1` (`0.0.0.0` in the container) |
 
 ## Deploy on Railway
