@@ -11,7 +11,7 @@ to a human, checked on every call, narrowing at each hand-off, revocable at any 
 | `pact-board` (this repo) | the MCP server: 7 tools, mandates, the append-only hash-chained log |
 | An OAuth 2.1 authorization server | signs people in for the hosted Claude apps. Bring any that issues JWT access tokens with a JWKS and supports CIMD or DCR (Keycloak, WorkOS, Auth0, …) |
 | Agent tokens | `pact_…` bearer tokens for Claude Code, Gemini CLI, hooks and the Runner — no OAuth needed |
-| `admin/` | the Admin UI (Next.js, for Vercel). It calls the board's Admin API at `/admin/api` |
+| [`pact-admin`](https://github.com/hugo8xx/pact-admin) (separate repo) | the Admin UI (Next.js, on Vercel). It calls the board's Admin API at `/admin/api` |
 
 Each agent has its own URL: `https://<board>/mcp/a/<agent-id>`. With OAuth, the signed-in person
 must be the agent's owner; the board matches them to a registered human by verified email once,
@@ -77,7 +77,7 @@ The board serves the hooks at `POST /hooks/a/<agent-id>/{post-tool-use,stop}` an
 `<PACT_PUBLIC_URL>/admin`, signed in with a second factor (`amr` contains `mfa`). Agent tokens and
 tokens minted for agent URLs are refused. Roles: owners do everything (kill switch, production
 flag, freezing, banning); approvers approve tasks, register agents and issue or revoke mandates;
-viewers read. See [`admin/`](admin/README.md) for the UI.
+viewers read. The UI lives in its own repo, [hugo8xx/pact-admin](https://github.com/hugo8xx/pact-admin).
 
 ## Configuration
 
