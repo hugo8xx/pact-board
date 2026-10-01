@@ -27,6 +27,9 @@ class ResourceSettings:
     """The authorization server's issuer URL. Unset: OAuth is off and only agent tokens work."""
     admin_requires_mfa: bool = True
     """Admin API tokens must show a second factor in `amr`. Turn off only for an issuer that never sets it."""
+    admin_audience_override: str | None = None
+    """The audience Admin API tokens carry. Defaults to ``<public_url>/admin``; the Admin API service
+    sets it to the board's value so tokens stay the same wherever the API runs."""
 
     @classmethod
     def from_env(cls) -> "ResourceSettings":
@@ -34,11 +37,12 @@ class ResourceSettings:
             public_url=os.environ.get("PACT_PUBLIC_URL", "http://127.0.0.1:8787").rstrip("/"),
             issuer=(os.environ.get("PACT_AUTH_ISSUER") or "").rstrip("/") or None,
             admin_requires_mfa=os.environ.get("PACT_ADMIN_REQUIRE_MFA", "1") not in ("0", "false", "no"),
+            admin_audience_override=(os.environ.get("PACT_ADMIN_AUDIENCE") or "").rstrip("/") or None,
         )
 
     @property
     def admin_audience(self) -> str:
-        return f"{self.public_url}/admin"
+        return self.admin_audience_override or f"{self.public_url}/admin"
 
     def resource(self, agent_id: str) -> str:
         return f"{self.public_url}/mcp/a/{agent_id}"
