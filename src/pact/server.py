@@ -144,7 +144,13 @@ def build_mcp(board: Board) -> MCPServer:
         ctx: Context,
         task_id: TaskId,
         status: Annotated[
-            ReportStatus, Field(description="working = heartbeat (send at least every 20 minutes); others close the task.")
+            ReportStatus,
+            Field(
+                description=(
+                    "working = heartbeat (send at least every 20 minutes); "
+                    "input_required = ask a human (the question goes in result); others close the task."
+                )
+            ),
         ],
         mandate_id: MandateId,
         result: Annotated[Any, Field(description="What you produced, or why it failed.")] = None,

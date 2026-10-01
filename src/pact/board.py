@@ -1,5 +1,6 @@
 """The seven board tools, as plain async methods. The MCP layer only maps arguments onto them."""
 
+import json
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -367,11 +368,25 @@ class Board:
             _require_scope(chain, board_scope(task["action"], project.id))
             if status == "working":
                 return {"ok": True, "task_id": task_id, "status": "working", "note": "heartbeat recorded"}
+            if status == "input_required":
+                # Waiting on a person is a deferral: it joins the deferred queue, where a human
+                # answers and resumes it with the same mandate. Otherwise nobody could pick it up again.
+                question = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                await conn.execute(
+                    """UPDATE tasks SET status = 'input_required', result = %s, deferred = true, defer_reason = %s,
+                              needed_scope = NULL, assignee = NULL, assignee_mandate_id = NULL
+                       WHERE id = %s""",
+                    (Jsonb(result) if result is not None else None, question or "input required", task_id),
+                )
+                return {
+                    "ok": True,
+                    "task_id": task_id,
+                    "status": "input_required",
+                    "note": "A human sees this in the deferred list, answers, and resumes it. Stop working on it.",
+                }
             await conn.execute(
-                """UPDATE tasks SET status = %(status)s, result = %(result)s,
-                          assignee = CASE WHEN %(status)s = 'input_required' THEN NULL ELSE assignee END
-                   WHERE id = %(id)s""",
-                {"status": status, "result": Jsonb(result) if result is not None else None, "id": task_id},
+                "UPDATE tasks SET status = %s, result = %s WHERE id = %s",
+                (status, Jsonb(result) if result is not None else None, task_id),
             )
             out: dict[str, Any] = {"ok": True, "task_id": task_id, "status": status}
             closed = await revoke_closed_task_mandates(conn, [task_id])
