@@ -18,7 +18,7 @@ from .errors import PactError
 from .mandates import Chain, Limits, consume_limits, get_mandate, issue_child, revoke_subtree, verify_chain
 from .scope import action_covers, any_covers, board_scope
 
-Client = Literal["chat", "cowork", "code", "gemini", "runner"]
+Client = Literal["chat", "cowork", "design", "code", "gemini", "runner"]
 ListFilter = Literal["mine", "open", "all"]
 ReportStatus = Literal["working", "completed", "failed", "canceled", "input_required"]
 

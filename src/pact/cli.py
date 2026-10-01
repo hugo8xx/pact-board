@@ -46,7 +46,7 @@ def _parser() -> argparse.ArgumentParser:
     ar = sub.add_parser("agent-register")
     ar.add_argument("id")
     ar.add_argument("--by", required=True)
-    ar.add_argument("--client", required=True, choices=["chat", "cowork", "code", "gemini", "runner"])
+    ar.add_argument("--client", required=True, choices=["chat", "cowork", "design", "code", "gemini", "runner"])
     ar.add_argument("--projects", required=True, type=_csv, help="comma-separated project ids")
     ar.add_argument("--scope", type=_csv, help="comma-separated scopes (default: read/post/work on each project)")
     ar.add_argument("--limits", type=json.loads, help='JSON, e.g. {"thb": 100000}')
