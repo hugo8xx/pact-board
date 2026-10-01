@@ -169,3 +169,98 @@ async def test_people_manage_project_context(world: World, board: tuple[str, Res
     assert [(n["key"], n["pinned"]) for n in listed] == [("conventions", True)]
     detail = (await api(url, "GET", path, vic)).json()
     assert detail["note"]["updated_by"] == "human:boss" and [v["version"] for v in detail["versions"]] == [1]
+
+
+async def test_people_assign_tasks_to_agents_that_can_claim(
+    world: World, board: tuple[str, ResourceSettings], issuer: Issuer
+) -> None:
+    from pact.errors import PactError
+
+    url, settings = board
+    await people(world)
+    await world.agent("code-two", "code", ["web"])
+    boss = admin_token(issuer, settings)
+    chat = world.agents["chat-boss"]
+    t = (await world.board.post(chat, project_id="web", title="fix", mandate_id=world.roots["chat-boss"]))["task_id"]
+
+    r = await api(url, "POST", f"/tasks/{t}/assign", boss, {"agent": "chat-boss"})
+    assert r.status_code == 400 and "cannot claim" in r.json()["message"]
+    r = await api(url, "POST", f"/tasks/{t}/assign", boss, {"agent": "nobody"})
+    assert r.json()["error"] == "agent_unknown"
+    vic = admin_token(issuer, settings, who="vic")
+    assert (await api(url, "POST", f"/tasks/{t}/assign", vic, {"agent": "code-web"})).status_code == 403
+
+    assert (await api(url, "POST", f"/tasks/{t}/assign", boss, {"agent": "code-web"})).json()["delegate_to"] == "code-web"
+    with pytest.raises(PactError) as e:
+        await world.board.claim(world.agents["code-two"], task_id=t, mandate_id=world.roots["code-two"])
+    assert e.value.code == "wrong_agent"
+
+    # Open to anyone again, then claimed.
+    assert (await api(url, "POST", f"/tasks/{t}/assign", boss, {"agent": None})).json()["delegate_to"] is None
+    await world.board.claim(world.agents["code-two"], task_id=t, mandate_id=world.roots["code-two"])
+    r = await api(url, "POST", f"/tasks/{t}/assign", boss, {"agent": "code-web"})
+    assert r.status_code == 400 and "release it first" in r.json()["message"]
+
+    trace = (await api(url, "GET", f"/tasks/{t}", boss)).json()
+    assigns = [e["payload"] for e in trace["entries"] if e["action"] == "admin.task.assign"]
+    assert [(p["from"], p["to"]) for p in assigns] == [(None, "code-web"), ("code-web", None)]
+
+
+async def test_reassigning_revokes_the_mandate_delegated_for_the_task(
+    world: World, board: tuple[str, ResourceSettings], issuer: Issuer
+) -> None:
+    from pact.errors import PactError
+
+    url, settings = board
+    await people(world)
+    await world.agent("code-two", "code", ["web"])
+    boss = admin_token(issuer, settings)
+    out = await world.board.post(
+        world.agents["chat-boss"], project_id="web", title="fix", delegate_to="code-web", mandate_id=world.roots["chat-boss"]
+    )
+    t, child = out["task_id"], out["delegated_mandate_id"]
+
+    r = (await api(url, "POST", f"/tasks/{t}/assign", boss, {"agent": "code-two"})).json()
+    assert r["revoked_mandate"] == child
+    with pytest.raises(PactError) as e:
+        await world.board.list_tasks(world.agents["code-web"], mandate_id=child)
+    assert e.value.code == "mandate_revoked"
+
+    # The task itself stays open, and the new agent takes it with its own mandate.
+    await world.board.claim(world.agents["code-two"], task_id=t, mandate_id=world.roots["code-two"])
+    assert (await api(url, "GET", f"/tasks/{t}", boss)).json()["task"]["status"] == "working"
+
+
+async def test_people_release_and_cancel_tasks(world: World, board: tuple[str, ResourceSettings], issuer: Issuer) -> None:
+    from pact.errors import PactError
+
+    url, settings = board
+    await people(world)
+    boss = admin_token(issuer, settings)
+    code = world.agents["code-web"]
+    out = await world.board.post(
+        world.agents["chat-boss"], project_id="web", title="fix", delegate_to="code-web", mandate_id=world.roots["chat-boss"]
+    )
+    t, child = out["task_id"], out["delegated_mandate_id"]
+    assert (await api(url, "POST", f"/tasks/{t}/release", boss)).status_code == 400  # nobody holds it
+
+    await world.board.claim(code, task_id=t, mandate_id=child)
+    assert (await api(url, "POST", f"/tasks/{t}/release", boss)).json()["released_from"] == "code-web"
+    with pytest.raises(PactError) as e:
+        await world.board.report(code, task_id=t, status="completed", mandate_id=child, result="done")
+    assert e.value.code == "claim_lost"
+
+    # Deferred tasks can be canceled too; the delegated mandate dies with the task.
+    await world.board.claim(code, task_id=t, mandate_id=child)
+    await world.board.defer(code, task_id=t, reason="stuck", mandate_id=child)
+    open_ids = [x["id"] for x in (await api(url, "GET", "/tasks?open=1&agent=code-web", boss)).json()]
+    assert open_ids == [t]
+    r = await api(url, "POST", f"/tasks/{t}/cancel", boss, {"reason": "stale"})
+    assert r.status_code == 200 and r.json()["revoked"][0]["mandate_id"] == child
+    task = (await api(url, "GET", f"/tasks/{t}", boss)).json()["task"]
+    assert task["status"] == "canceled" and not task["deferred"] and task["result"]["note"] == "stale"
+    assert (await api(url, "GET", "/tasks?open=1", boss)).json() == []
+    assert (await api(url, "POST", f"/tasks/{t}/cancel", boss)).status_code == 400  # already closed
+    with pytest.raises(PactError) as e:
+        await world.board.list_tasks(code, mandate_id=child)
+    assert e.value.code == "mandate_revoked"

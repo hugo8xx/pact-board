@@ -6,10 +6,18 @@ Agents never reach this module: nothing here is exposed over MCP.
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from . import context as notes
-from .board import Client, agent_projects, revoke_closed_task_mandates
+from .board import (
+    POST_ONLY_CLIENTS,
+    TERMINAL_STATUSES,
+    Client,
+    agent_projects,
+    get_agent,
+    revoke_closed_task_mandates,
+)
 from .crypto import new_token, sha256
 from .db import Conn, fetchall, fetchone, transaction
 from .entries import SYSTEM_CHAIN, EntryInput, append_entry, erase_payload, verify_entry_chain
@@ -271,6 +279,101 @@ class Admin:
             if row is None:
                 raise PactError("invalid_request", f"task {task_id} is not deferred")
             await self._log(conn, by, "admin.task.resume", {}, project_id=row["project_id"], task_id=task_id)
+
+    async def _open_task(self, conn: Conn, task_id: str) -> dict[str, Any]:
+        """Lock a task a person is about to change; closed tasks are left as they ended."""
+        row = await fetchone(conn, "SELECT * FROM tasks WHERE id::text = %s FOR UPDATE", (task_id,))
+        if row is None:
+            raise PactError("not_found", f"task {task_id} does not exist")
+        if row["status"] in TERMINAL_STATUSES:
+            raise PactError("invalid_request", f"task {task_id} is {row['status']} and cannot change")
+        return row
+
+    async def assign_task(self, task_id: str, agent_id: str | None, *, by: str) -> dict[str, Any]:
+        """Name the one agent that may claim a task, or open it to any agent of the project (None).
+
+        Only while nobody holds it: release it first. The new agent claims with its own mandate.
+        A mandate delegated to the previous agent for this task is revoked, since that agent no
+        longer has the task.
+        """
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            task = await self._open_task(conn, task_id)
+            if task["assignee"]:
+                raise PactError("invalid_request", f"task {task_id} is held by {task['assignee']}; release it first")
+            if agent_id is not None:
+                agent = await get_agent(conn, agent_id)
+                if agent is None or task["project_id"] not in {p.id for p in await agent_projects(conn, agent_id)}:
+                    raise PactError("agent_unknown", f"agent {agent_id} is not registered in project {task['project_id']}")
+                if agent.client in POST_ONLY_CLIENTS:
+                    raise PactError(
+                        "invalid_request", f"{agent_id} is a {agent.client} agent; it posts tasks but cannot claim them"
+                    )
+                if agent.status == "banned":
+                    raise PactError("agent_paused", f"agent {agent_id} is banned")
+            old_mandate = task["delegated_mandate_id"] if task["delegate_to"] != agent_id else None
+            await conn.execute(
+                "UPDATE tasks SET delegate_to = %s, delegated_mandate_id = %s WHERE id = %s",
+                (agent_id, None if old_mandate else task["delegated_mandate_id"], task["id"]),
+            )
+            revoked: dict[str, Any] = {"descendant_mandates": 0, "tasks_stopped": 0, "stopped": []}
+            if old_mandate:
+                revoked = await revoke_subtree(conn, str(old_mandate))
+            await self._log(
+                conn,
+                by,
+                "admin.task.assign",
+                {"from": task["delegate_to"], "to": agent_id, "revoked_mandate": str(old_mandate) if old_mandate else None},
+                project_id=task["project_id"],
+                task_id=str(task["id"]),
+            )
+            await revoke_closed_task_mandates(conn, [tid for tid, _ in revoked["stopped"]])
+            return {"delegate_to": agent_id, "revoked_mandate": str(old_mandate) if old_mandate else None}
+
+    async def release_task(self, task_id: str, *, by: str) -> dict[str, Any]:
+        """Take a task back from the agent holding it; it returns to the board as submitted.
+
+        The agent's next report gets claim_lost, so it stops without overwriting anyone.
+        """
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            task = await self._open_task(conn, task_id)
+            if task["status"] != "working" or not task["assignee"]:
+                raise PactError("invalid_request", f"task {task_id} is not held by an agent")
+            await conn.execute(
+                """UPDATE tasks SET assignee = NULL, assignee_mandate_id = NULL, status = 'submitted', claimed_at = NULL
+                   WHERE id = %s""",
+                (task["id"],),
+            )
+            await self._log(
+                conn,
+                by,
+                "admin.task.release",
+                {"released_from": task["assignee"]},
+                project_id=task["project_id"],
+                task_id=str(task["id"]),
+            )
+            return {"released_from": task["assignee"]}
+
+    async def cancel_task(self, task_id: str, *, by: str, reason: str | None = None) -> dict[str, Any]:
+        """Close a task nobody should do any more. Its delegated mandate dies with it, as with any close."""
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            task = await self._open_task(conn, task_id)
+            await conn.execute(
+                "UPDATE tasks SET status = 'canceled', deferred = false, result = %s WHERE id = %s",
+                (Jsonb({"reason": "canceled_by_human", "by": by, "note": reason}), task["id"]),
+            )
+            await self._log(
+                conn,
+                by,
+                "admin.task.cancel",
+                {"reason": reason, "status_was": task["status"], "assignee": task["assignee"]},
+                project_id=task["project_id"],
+                task_id=str(task["id"]),
+            )
+            done = await revoke_closed_task_mandates(conn, [str(task["id"])])
+            return {"revoked": done}
 
     async def erase_payload(self, entry_id: int, *, by: str) -> bool:
         async with transaction(self.pool) as conn:

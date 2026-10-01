@@ -20,6 +20,7 @@ from starlette.routing import Route
 
 from . import context as notes
 from .admin import Admin
+from .board import TERMINAL_STATUSES
 from .db import Conn, fetchall, fetchone, transaction
 from .errors import PactError
 from .oauth import TokenRejected, Verifier, human_for
@@ -184,7 +185,7 @@ class AdminApi:
     async def tasks(self, request: Request, _h: str) -> Any:
         q = request.query_params
         where: list[str] = ["true"]
-        params: list[str] = []
+        params: list[Any] = []
         if q.get("status"):
             where.append("status = %s")
             params.append(q["status"])
@@ -193,11 +194,18 @@ class AdminApi:
             params.append(q["project"])
         if q.get("deferred") == "1":
             where.append("deferred")
+        if q.get("open") == "1":
+            where.append("status <> ALL(%s)")
+            params.append(list(TERMINAL_STATUSES))
+        if q.get("agent"):
+            where.append("(assignee = %s OR delegate_to = %s OR created_by = %s)")
+            params.extend([q["agent"]] * 3)
         async with transaction(self.pool) as conn:
             return await fetchall(
                 conn,
                 f"""SELECT id, project_id, title, body, action, status, created_by, delegate_to, assignee, deferred,
-                           defer_reason, needed_scope, result, approved_by, approved_at, claimed_at, created_at, updated_at
+                           defer_reason, needed_scope, result, approved_by, approved_at, claimed_at, parent_task_id,
+                           created_at, updated_at
                     FROM tasks WHERE {" AND ".join(where)} ORDER BY updated_at DESC LIMIT 200""",
                 params,
             )
@@ -364,6 +372,14 @@ class AdminApi:
             await self.admin.approve_task(task_id, by=human, approve=decision == "approve")
         elif decision == "resume":
             await self.admin.resume_task(task_id, by=human)
+        elif decision == "assign":
+            agent = (await _body(request)).get("agent") or None
+            return {"ok": True, **await self.admin.assign_task(task_id, agent, by=human)}
+        elif decision == "release":
+            return {"ok": True, **await self.admin.release_task(task_id, by=human)}
+        elif decision == "cancel":
+            reason = (await _body(request)).get("reason") or None
+            return {"ok": True, **await self.admin.cancel_task(task_id, by=human, reason=reason)}
         else:
             raise PactError("not_found", f"unknown decision {decision}")
         return {"ok": True}
