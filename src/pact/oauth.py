@@ -25,13 +25,20 @@ class ResourceSettings:
     """This server's public URL, e.g. https://mcp.example.com (no trailing slash)."""
     issuer: str | None
     """The authorization server's issuer URL. Unset: OAuth is off and only agent tokens work."""
+    admin_requires_mfa: bool = True
+    """Admin API tokens must show a second factor in `amr`. Turn off only for an issuer that never sets it."""
 
     @classmethod
     def from_env(cls) -> "ResourceSettings":
         return cls(
             public_url=os.environ.get("PACT_PUBLIC_URL", "http://127.0.0.1:8787").rstrip("/"),
             issuer=(os.environ.get("PACT_AUTH_ISSUER") or "").rstrip("/") or None,
+            admin_requires_mfa=os.environ.get("PACT_ADMIN_REQUIRE_MFA", "1") not in ("0", "false", "no"),
         )
+
+    @property
+    def admin_audience(self) -> str:
+        return f"{self.public_url}/admin"
 
     def resource(self, agent_id: str) -> str:
         return f"{self.public_url}/mcp/a/{agent_id}"
@@ -81,6 +88,16 @@ class Verifier:
 
     async def verify(self, token: str, agent_id: str) -> dict[str, Any]:
         """Signature, issuer, expiry, and an audience of this agent's URL (or the server itself)."""
+        return await self._decode(token, [self.settings.resource(agent_id), self.settings.public_url])
+
+    async def verify_admin(self, token: str) -> dict[str, Any]:
+        """A token minted for the Admin API only. Tokens for agent URLs carry another audience."""
+        claims = await self._decode(token, [self.settings.admin_audience])
+        if self.settings.admin_requires_mfa and "mfa" not in (claims.get("amr") or []):
+            raise TokenRejected("the Admin API needs a sign-in with a second factor")
+        return claims
+
+    async def _decode(self, token: str, audiences: list[str]) -> dict[str, Any]:
         if not self.settings.issuer:
             raise TokenRejected("OAuth is not configured")
         await self.issuer_metadata()
@@ -92,7 +109,7 @@ class Verifier:
                 key.key,
                 algorithms=ALGORITHMS,
                 issuer=self.settings.issuer,
-                audience=[self.settings.resource(agent_id), self.settings.public_url],
+                audience=audiences,
                 options={"require": ["exp", "sub", "iss", "aud"]},
                 leeway=30,
             )

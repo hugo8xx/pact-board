@@ -17,6 +17,7 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .admin_api import build_admin_app
 from .auth import agent_for_token
 from .board import Agent, Board, ListFilter, ReportStatus
 from .db import Conn, create_pool, transaction
@@ -192,6 +193,7 @@ class PactApp:
         self.mcp_app = mcp_app
         self.settings = settings
         self.verifier = Verifier(settings)
+        self.admin_app = build_admin_app(pool, self.verifier)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -203,6 +205,9 @@ class PactApp:
         path: str = scope["path"]
         if path == "/healthz":
             await _respond(send, 200, {"ok": True})
+            return
+        if path.startswith("/admin/api/"):
+            await self.admin_app(scope, receive, send)
             return
         meta = _METADATA_PATH.match(path)
         if meta:
