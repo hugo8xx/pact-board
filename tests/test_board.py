@@ -58,6 +58,18 @@ async def test_post_only_clients_cannot_claim(world: World) -> None:
     )
 
 
+async def test_design_agents_claim_and_report_design_work(world: World) -> None:
+    await setup_web(world)
+    design = await world.agent("design-web", "design", ["web"])
+    t = await world.board.post(
+        world.agents["chat-boss"], project_id="web", title="ui", delegate_to="design-web", mandate_id=world.roots["chat-boss"]
+    )
+    child = t["delegated_mandate_id"]
+    await world.board.claim(design, task_id=t["task_id"], mandate_id=child)
+    out = await world.board.report(design, task_id=t["task_id"], status="completed", mandate_id=child, result="link")
+    assert out["status"] == "completed"
+
+
 # ── mandate rules ─────────────────────────────────────────────────────────────
 
 
