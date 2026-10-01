@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from psycopg_pool import AsyncConnectionPool
 
+from . import context as notes
 from .board import Client, agent_projects, revoke_closed_task_mandates
 from .crypto import new_token, sha256
 from .db import Conn, fetchall, fetchone, transaction
@@ -286,6 +287,37 @@ class Admin:
                 else [r["chain_key"] for r in await fetchall(conn, "SELECT chain_key FROM entry_chain_heads ORDER BY chain_key")]
             )
             return [(await verify_entry_chain(conn, k)).__dict__ for k in keys or [SYSTEM_CHAIN]]
+
+    async def write_note(
+        self, project_id: str, key: str, *, by: str, title: str | None = None, body: str | None = None, archive: bool = False
+    ) -> dict[str, Any]:
+        """A person writes project context; pinned notes too."""
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            out = await notes.write_note(
+                conn, project_id, key, by=f"human:{by}", title=title, body=body, archive=archive, human=True
+            )
+            await self._log(
+                conn,
+                by,
+                "admin.context.write",
+                {"key": key, "title": title, "body": body, "archive": archive},
+                project_id=project_id,
+            )
+            return out
+
+    async def pin_note(self, project_id: str, key: str, pinned: bool, *, by: str) -> None:
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            await notes.set_pinned(conn, project_id, key, pinned)
+            await self._log(conn, by, "admin.context.pin", {"key": key, "pinned": pinned}, project_id=project_id)
+
+    async def erase_note_version(self, version_id: int, *, by: str) -> dict[str, Any]:
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "owner")
+            out = await notes.erase_version(conn, version_id)
+            await self._log(conn, by, "admin.context.erase", {"version_id": version_id}, project_id=out["project_id"])
+            return out
 
     async def sweep_closed_task_mandates(self) -> list[dict[str, Any]]:
         """Revoke mandates still alive under tasks that already closed. Idempotent; runs with

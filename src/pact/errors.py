@@ -22,6 +22,7 @@ ErrorCode = Literal[
     "not_found",
     "invalid_request",
     "forbidden",
+    "note_pinned",
 ]
 
 
