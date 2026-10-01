@@ -628,3 +628,24 @@ async def test_sweep_revokes_mandates_left_behind_by_closed_tasks(world: World) 
     await refused(world.board.list_tasks(code, mandate_id=done["delegated_mandate_id"]), "mandate_revoked")
     await world.board.list_tasks(code, mandate_id=still_open["delegated_mandate_id"])
     assert all(v["ok"] for v in await world.admin.verify_log())
+
+
+async def test_input_required_waits_for_a_human_and_resumes(world: World) -> None:
+    await setup_web(world)
+    chat, code = world.agents["chat-boss"], world.agents["code-web"]
+    t = await world.board.post(
+        chat, project_id="web", title="which db?", mandate_id=world.roots["chat-boss"], delegate_to="code-web"
+    )
+    child = t["delegated_mandate_id"]
+    await world.board.claim(code, task_id=t["task_id"], mandate_id=child)
+    out = await world.board.report(
+        code, task_id=t["task_id"], status="input_required", mandate_id=child, result="Postgres or SQLite?"
+    )
+    assert out["status"] == "input_required"
+
+    listed = await world.board.list_tasks(chat, mandate_id=world.roots["chat-boss"], filter="all")
+    [waiting] = listed["deferred"]
+    assert waiting["id"] == t["task_id"] and waiting["defer_reason"] == "Postgres or SQLite?"
+
+    await world.admin.resume_task(t["task_id"], by="boss")
+    await world.board.claim(code, task_id=t["task_id"], mandate_id=child)  # same task, same mandate
