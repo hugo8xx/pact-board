@@ -264,3 +264,71 @@ async def test_people_release_and_cancel_tasks(world: World, board: tuple[str, R
     with pytest.raises(PactError) as e:
         await world.board.list_tasks(code, mandate_id=child)
     assert e.value.code == "mandate_revoked"
+
+
+async def test_revoke_impact_is_a_dry_run_of_revoke(world: World, board: tuple[str, ResourceSettings], issuer: Issuer) -> None:
+    url, settings = board
+    await people(world)
+    await world.agent("code-two", "code", ["web"])
+    boss = admin_token(issuer, settings)
+    root = world.roots["chat-boss"]
+    a = await world.board.post(
+        world.agents["chat-boss"],
+        project_id="web",
+        title="a",
+        delegate_to="code-web",
+        child_scope=["task.read@project:web", "task.work@project:web", "task.post@project:web"],
+        mandate_id=root,
+    )
+    b = await world.board.post(
+        world.agents["code-web"], project_id="web", title="b", delegate_to="code-two", mandate_id=a["delegated_mandate_id"]
+    )
+
+    impact = (await api(url, "GET", f"/mandates/{root}/impact", boss)).json()
+    assert [(d["id"], d["holder"], d["depth"]) for d in impact["descendants"]] == [
+        (a["delegated_mandate_id"], "code-web", 1),
+        (b["delegated_mandate_id"], "code-two", 2),
+    ]
+    assert sorted(t["id"] for t in impact["tasks"]) == sorted([a["task_id"], b["task_id"]])
+    assert impact["agents"] == ["chat-boss", "code-two", "code-web"]
+    assert (await api(url, "GET", "/mandates/nope/impact", boss)).status_code == 404
+
+    # Nothing changed; the real revoke then does what the dry run said.
+    done = (await api(url, "POST", f"/mandates/{root}/revoke", boss)).json()
+    assert done == {"descendant_mandates": 2, "tasks_stopped": len(impact["tasks"])}
+
+
+async def test_mandates_show_their_task_and_agents_their_mandates(
+    world: World, board: tuple[str, ResourceSettings], issuer: Issuer
+) -> None:
+    url, settings = board
+    await people(world)
+    boss = admin_token(issuer, settings)
+    out = await world.board.post(
+        world.agents["chat-boss"], project_id="web", title="fix", delegate_to="code-web", mandate_id=world.roots["chat-boss"]
+    )
+    mandates = {m["id"]: m for m in (await api(url, "GET", "/mandates", boss)).json()}
+    assert mandates[out["delegated_mandate_id"]]["task"] == {"id": out["task_id"], "title": "fix", "status": "submitted"}
+    assert mandates[world.roots["chat-boss"]]["task"] is None
+    agents = {a["id"]: a for a in (await api(url, "GET", "/agents", boss)).json()}
+    assert agents["code-web"]["live_mandates"] == 2  # its root and the one delegated for the task
+
+
+async def test_people_answer_deferred_tasks_when_resuming(
+    world: World, board: tuple[str, ResourceSettings], issuer: Issuer
+) -> None:
+    url, settings = board
+    await people(world)
+    boss = admin_token(issuer, settings)
+    code = world.agents["code-web"]
+    out = await world.board.post(
+        world.agents["chat-boss"], project_id="web", title="landing", delegate_to="code-web", mandate_id=world.roots["chat-boss"]
+    )
+    t, child = out["task_id"], out["delegated_mandate_id"]
+    await world.board.claim(code, task_id=t, mandate_id=child)
+    await world.board.report(code, task_id=t, status="input_required", mandate_id=child, result="Thai or English?")
+
+    r = await api(url, "POST", f"/tasks/{t}/resume", boss, {"answer": "Thai first"})
+    assert r.status_code == 200
+    seen = (await world.board.list_tasks(code, mandate_id=child, filter="open"))["tasks"]
+    assert [(x["id"], x["answer"]) for x in seen] == [(t, "Thai first")]

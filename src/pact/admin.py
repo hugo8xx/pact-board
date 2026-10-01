@@ -22,7 +22,7 @@ from .crypto import new_token, sha256
 from .db import Conn, fetchall, fetchone, transaction
 from .entries import SYSTEM_CHAIN, EntryInput, append_entry, erase_payload, verify_entry_chain
 from .errors import PactError
-from .mandates import Limits, get_mandate, issue_root, revoke_subtree
+from .mandates import Limits, get_mandate, issue_root, revoke_impact, revoke_subtree
 from .scope import board_scope, is_valid_scope
 
 Role = Literal["owner", "approver", "viewer"]
@@ -237,6 +237,13 @@ class Admin:
             await revoke_closed_task_mandates(conn, [tid for tid, _ in r["stopped"]])
             return {"descendant_mandates": r["descendant_mandates"], "tasks_stopped": r["tasks_stopped"]}
 
+    async def revoke_mandate_impact(self, mandate_id: str) -> dict[str, Any]:
+        """A dry run of revoke_mandate, for the confirmation people see before they revoke."""
+        async with transaction(self.pool) as conn:
+            if await get_mandate(conn, mandate_id) is None:
+                raise PactError("not_found", f"mandate {mandate_id} does not exist")
+            return await revoke_impact(conn, mandate_id)
+
     async def set_agent_status(self, agent_id: str, status: Literal["active", "paused", "banned"], *, by: str) -> None:
         async with transaction(self.pool) as conn:
             await self._require(conn, by, "owner" if status == "banned" else "approver")
@@ -266,19 +273,20 @@ class Admin:
             if not approve:
                 await revoke_closed_task_mandates(conn, [task_id])
 
-    async def resume_task(self, task_id: str, *, by: str) -> None:
-        """Put a deferred task back on the board, unchanged, once a human has decided."""
+    async def resume_task(self, task_id: str, *, by: str, answer: str | None = None) -> None:
+        """Put a deferred task back on the board once a human has decided, with their answer to
+        the agent's question if they gave one. The agent reads it as the task's `answer`."""
         async with transaction(self.pool) as conn:
             await self._require(conn, by, "approver")
             row = await fetchone(
                 conn,
-                """UPDATE tasks SET status = 'submitted', deferred = false
+                """UPDATE tasks SET status = 'submitted', deferred = false, answer = coalesce(%s, answer)
                    WHERE id = %s AND deferred RETURNING project_id""",
-                (task_id,),
+                (answer, task_id),
             )
             if row is None:
                 raise PactError("invalid_request", f"task {task_id} is not deferred")
-            await self._log(conn, by, "admin.task.resume", {}, project_id=row["project_id"], task_id=task_id)
+            await self._log(conn, by, "admin.task.resume", {"answer": answer}, project_id=row["project_id"], task_id=task_id)
 
     async def _open_task(self, conn: Conn, task_id: str) -> dict[str, Any]:
         """Lock a task a person is about to change; closed tasks are left as they ended."""
