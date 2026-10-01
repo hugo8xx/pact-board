@@ -51,6 +51,26 @@ put the agent's URL and token in the repo's `.mcp.json`:
 `uv run pact-admin --help` lists the human-side commands (approve, resume, pause, freeze, halt,
 revoke, erase a payload, verify the log).
 
+## Claude Code hooks
+
+Two optional hooks connect a Claude Code session to the board. Neither claims work.
+
+| Hook | What it does |
+| --- | --- |
+| `PostToolUse` | logs each shell command and file edit as an Entry on the one task the agent is working on (secrets redacted, output not kept). These entries are heartbeats, so a long task is not released. With no task in hand, nothing is logged. |
+| `Stop` | after each reply, tells the person (not the model) when open tasks arrived since that session last looked. |
+
+Set up, per repo:
+
+1. Put the agent's URL and token outside the repo, readable only by you:
+   `~/.config/pact/<agent-id>.env` containing `PACT_URL=https://<board>` and `PACT_TOKEN=pact_…` (`chmod 600`).
+2. Copy the `hooks` block of [`hooks/settings.local.example.json`](hooks/settings.local.example.json) into the repo's
+   `.claude/settings.local.json` (not `settings.json`, which is committed), with the path to `hooks/pact-hook.sh`
+   and the agent id.
+
+The script needs only `sh` and `curl`. If the config is missing or the board is down it prints nothing and exits 0.
+The board serves the hooks at `POST /hooks/a/<agent-id>/{post-tool-use,stop}` and accepts agent tokens only.
+
 ## Admin API
 
 `/admin/api/*` is for people, not agents: it takes an OAuth access token whose audience is
@@ -99,6 +119,8 @@ The test suite drops and recreates the `public` schema of the test database on e
 | `src/pact/admin.py` | human-only operations (the Admin UI backend) |
 | `src/pact/oauth.py` | the board as an OAuth protected resource (RFC 9728, JWKS verification) |
 | `src/pact/server.py` | MCP tools, `/mcp/a/<agent>` routing, agent-token and OAuth auth |
+| `src/pact/hooks.py` | the Claude Code hook endpoints |
+| `hooks/` | the hook script and a settings example |
 | `src/pact/migrations/` | SQL schema |
 | `tests/` | one test per done-criterion |
 

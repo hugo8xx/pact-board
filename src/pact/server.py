@@ -22,6 +22,8 @@ from .auth import agent_for_token
 from .board import Agent, Board, ListFilter, ReportStatus
 from .db import Conn, create_pool, transaction
 from .errors import PactError
+from .hooks import EVENTS as HOOK_EVENTS
+from .hooks import handle as handle_hook
 from .oauth import ResourceSettings, TokenRejected, Verifier, agent_for_oauth
 
 INSTRUCTIONS = """\
@@ -177,6 +179,7 @@ def build_mcp(board: Board) -> MCPServer:
 
 
 _AGENT_PATH = re.compile(r"^/mcp/a/([a-z0-9][a-z0-9-]{0,62})/?$")
+_HOOK_PATH = re.compile(r"^/hooks/a/([a-z0-9][a-z0-9-]{0,62})/([a-z-]+)$")
 _METADATA_PATH = re.compile(r"^/\.well-known/oauth-protected-resource/mcp/a/([a-z0-9][a-z0-9-]{0,62})/?$")
 
 
@@ -194,6 +197,7 @@ class PactApp:
         self.settings = settings
         self.verifier = Verifier(settings)
         self.admin_app = build_admin_app(pool, self.verifier)
+        self.board = Board(pool)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -208,6 +212,10 @@ class PactApp:
             return
         if path.startswith("/admin/api/"):
             await self.admin_app(scope, receive, send)
+            return
+        hook = _HOOK_PATH.match(path)
+        if hook:
+            await self._hook(scope, receive, send, hook.group(1), hook.group(2))
             return
         meta = _METADATA_PATH.match(path)
         if meta:
@@ -253,6 +261,21 @@ class PactApp:
         state = dict(scope.get("state") or {})
         state["pact_agent"] = agent
         await self.mcp_app({**scope, "path": "/mcp", "raw_path": b"/mcp", "state": state}, receive, send)
+
+    async def _hook(self, scope: Scope, receive: Receive, send: Send, agent_id: str, event: str) -> None:
+        """Claude Code hooks authenticate with the agent's token only; OAuth is for the Claude apps."""
+        if event not in HOOK_EVENTS:
+            await _respond(send, 404, {"error": "not_found", "message": f"hook events: {', '.join(HOOK_EVENTS)}"})
+            return
+        token = _bearer(scope) or ""
+        agent: Agent | None = None
+        if token.startswith("pact_"):
+            async with transaction(self.pool) as conn:
+                agent = await agent_for_token(conn, agent_id, token)
+        if agent is None:
+            await _respond(send, 401, {"error": "unauthorized", "message": "hooks need a live agent token for this agent"})
+            return
+        await handle_hook(scope, receive, send, self.board, agent, event)
 
     async def _lifespan(self, scope: Scope, receive: Receive, send: Send) -> None:
         # Open the pool, then let the MCP app run its own lifespan (its session manager) inside.

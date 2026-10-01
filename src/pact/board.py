@@ -428,6 +428,65 @@ class Board:
 
         return await self._call(agent, "pact_revoke", {"mandate_id": mandate_id}, run)
 
+    # ── Claude Code hooks (not MCP tools; see hooks.py) ──────────────────────
+
+    async def record_tool_use(self, agent: Agent, summary: dict[str, Any]) -> dict[str, Any]:
+        """Log one PostToolUse summary as an Entry on the task the agent is working on.
+
+        The hook cannot know the task, so the board picks the one task the agent holds. With
+        none, or with several, nothing is logged: Claude Code work outside a claimed task stays
+        off the board. The entry runs under the mandate the task was claimed with, and like any
+        entry by the assignee it is a heartbeat, so a task worked on for hours is not released.
+        """
+        async with transaction(self.pool) as conn:
+            held = await fetchall(conn, "SELECT id FROM tasks WHERE assignee = %s AND status = 'working' LIMIT 2", (agent.id,))
+        if len(held) != 1:
+            return {"logged": False, "reason": "no task held" if not held else "several tasks held"}
+        task_id = str(held[0]["id"])
+
+        async def run(conn: Conn, ctx: _CallContext) -> dict[str, Any]:
+            task = await self._visible_task(conn, ctx, agent, task_id)
+            if task["assignee"] != agent.id or task["status"] != "working":
+                raise PactError("claim_lost", f"task {task_id} is no longer claimed by {agent.id}")
+            await self._chain(conn, ctx, str(task["assignee_mandate_id"]), agent)
+            project = await _get_project(conn, task["project_id"])
+            if project.frozen:
+                raise PactError("project_frozen", f"project {project.id} is frozen")
+            return {"logged": True, "task_id": task_id}
+
+        return await self._call(agent, "hook.post_tool_use", summary, run)
+
+    async def new_tasks_for_session(self, agent: Agent, session_id: str) -> dict[str, Any]:
+        """Open tasks this Claude Code session has not been told about yet (Stop hook).
+
+        Reads like ``pact_list(filter="open", since=…)`` under the agent's own mandate, with the
+        cursor kept on the board per session. It only reports; it never claims.
+        """
+        async with transaction(self.pool) as conn:
+            mandate = await fetchone(
+                conn,
+                """SELECT m.id::text FROM mandates m JOIN agents a ON a.id = m.holder
+                   WHERE m.holder = %s AND m.revoked_at IS NULL AND m.expires_at > now()
+                   ORDER BY (m.id = a.root_mandate_id) DESC, m.depth, m.created_at LIMIT 1""",
+                (agent.id,),
+            )
+            cursor = await fetchone(
+                conn, "SELECT since FROM hook_cursors WHERE agent_id = %s AND session_id = %s", (agent.id, session_id)
+            )
+        if mandate is None:
+            raise PactError("mandate_expired", f"agent {agent.id} holds no live mandate")
+        listed = await self.list_tasks(
+            agent, mandate_id=mandate["id"], filter="open", since=cursor["since"] if cursor else None, limit=50
+        )
+        async with transaction(self.pool) as conn:
+            await conn.execute(
+                """INSERT INTO hook_cursors (agent_id, session_id, since) VALUES (%s, %s, %s)
+                   ON CONFLICT (agent_id, session_id) DO UPDATE SET since = EXCLUDED.since, updated_at = now()""",
+                (agent.id, session_id, listed["next_since"]),
+            )
+            await conn.execute("DELETE FROM hook_cursors WHERE updated_at < now() - interval '30 days'")
+        return listed
+
     # ── helpers ──────────────────────────────────────────────────────────────
 
     async def _project_for(self, conn: Conn, agent: Agent, project_id: str) -> Project:
