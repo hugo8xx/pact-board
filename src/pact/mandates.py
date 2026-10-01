@@ -318,29 +318,51 @@ async def get_mandate(conn: Conn, mandate_id: str) -> Mandate | None:
     return Mandate.from_row(row) if row else None
 
 
+async def _subtree(conn: Conn, mandate_id: str) -> list[dict[str, Any]]:
+    """The mandate and everything delegated under it, with depth below it (0 for itself)."""
+    return await fetchall(
+        conn,
+        """WITH RECURSIVE sub AS (
+             SELECT id, holder, revoked_at, 0 AS below FROM mandates WHERE id = %s
+             UNION ALL
+             SELECT m.id, m.holder, m.revoked_at, s.below + 1 FROM mandates m JOIN sub s ON m.parent_id = s.id
+           ) SELECT id::text, holder, revoked_at, below FROM sub ORDER BY below""",
+        (mandate_id,),
+    )
+
+
+_OPEN_UNDER = """status IN ('submitted', 'working', 'input_required', 'auth_required')
+             AND (mandate_id = ANY(%(ids)s::uuid[]) OR assignee_mandate_id = ANY(%(ids)s::uuid[])
+                  OR delegated_mandate_id = ANY(%(ids)s::uuid[]))"""
+
+
+async def revoke_impact(conn: Conn, mandate_id: str) -> dict[str, Any]:
+    """What revoking a mandate would do, without doing it: the live mandates below it, the open
+    tasks that would be canceled, and the agents that lose authority."""
+    subtree = [m for m in await _subtree(conn, mandate_id) if m["revoked_at"] is None]
+    tasks = await fetchall(
+        conn,
+        f"""SELECT id::text, title, status, assignee FROM tasks WHERE {_OPEN_UNDER} ORDER BY created_at""",
+        {"ids": [m["id"] for m in subtree]},
+    )
+    return {
+        "mandate_id": mandate_id,
+        "descendants": [{"id": m["id"], "holder": m["holder"], "depth": m["below"]} for m in subtree if m["below"]],
+        "tasks": tasks,
+        "agents": sorted({m["holder"] for m in subtree}),
+    }
+
+
 async def revoke_subtree(conn: Conn, mandate_id: str) -> dict[str, Any]:
     """Revoke a mandate. Descendants die with it (the chain check sees the revoked ancestor),
     and every open task hanging under it stops."""
     await conn.execute("UPDATE mandates SET revoked_at = now() WHERE id = %s AND revoked_at IS NULL", (mandate_id,))
-    subtree = [
-        str(r["id"])
-        for r in await fetchall(
-            conn,
-            """WITH RECURSIVE sub AS (
-                 SELECT id FROM mandates WHERE id = %s
-                 UNION ALL
-                 SELECT m.id FROM mandates m JOIN sub s ON m.parent_id = s.id
-               ) SELECT id FROM sub""",
-            (mandate_id,),
-        )
-    ]
+    subtree = [m["id"] for m in await _subtree(conn, mandate_id)]
     stopped = await fetchall(
         conn,
-        """UPDATE tasks SET status = 'canceled', assignee = NULL, assignee_mandate_id = NULL,
+        f"""UPDATE tasks SET status = 'canceled', assignee = NULL, assignee_mandate_id = NULL,
                   result = jsonb_build_object('reason', 'mandate_revoked', 'mandate_id', %(id)s::text)
-           WHERE status IN ('submitted', 'working', 'input_required', 'auth_required')
-             AND (mandate_id = ANY(%(ids)s::uuid[]) OR assignee_mandate_id = ANY(%(ids)s::uuid[])
-                  OR delegated_mandate_id = ANY(%(ids)s::uuid[]))
+           WHERE {_OPEN_UNDER}
            RETURNING id, project_id""",
         {"id": mandate_id, "ids": subtree},
     )

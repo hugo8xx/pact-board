@@ -606,6 +606,8 @@ def _summary(t: dict[str, Any]) -> dict[str, Any]:
         "seq": t["change_seq"],
         "updated_at": iso(t["updated_at"]),
     }
+    if t["answer"]:
+        out["answer"] = t["answer"]
     if t["deferred"]:
         out["defer_reason"] = t["defer_reason"]
         out["needed_scope"] = t["needed_scope"]

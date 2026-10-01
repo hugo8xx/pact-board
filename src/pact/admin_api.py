@@ -153,7 +153,9 @@ class AdminApi:
                           coalesce(array_agg(ap.project_id ORDER BY ap.project_id)
                                    FILTER (WHERE ap.project_id IS NOT NULL), '{}') AS projects,
                           (SELECT count(*) FROM agent_tokens t
-                            WHERE t.agent_id = a.id AND t.revoked_at IS NULL AND t.expires_at > now()) AS live_tokens
+                            WHERE t.agent_id = a.id AND t.revoked_at IS NULL AND t.expires_at > now()) AS live_tokens,
+                          (SELECT count(*) FROM mandates m
+                            WHERE m.holder = a.id AND m.revoked_at IS NULL AND m.expires_at > now()) AS live_mandates
                    FROM agents a LEFT JOIN agent_projects ap ON ap.agent_id = a.id
                    GROUP BY a.id ORDER BY a.id""",
             )
@@ -176,11 +178,16 @@ class AdminApi:
                 f"""SELECT id, parent_id, issuer_kind, issuer, holder, scope, limits, delegations_left, depth,
                            expires_at, revoked_at, created_at,
                            (SELECT coalesce(jsonb_object_agg(limit_key, used), '{{}}') FROM limit_usage u
-                             WHERE u.mandate_id = m.id) AS usage
+                             WHERE u.mandate_id = m.id) AS usage,
+                           (SELECT jsonb_build_object('id', t.id, 'title', t.title, 'status', t.status) FROM tasks t
+                             WHERE t.delegated_mandate_id = m.id LIMIT 1) AS task
                     FROM mandates m
                     {"" if include_dead else "WHERE revoked_at IS NULL AND expires_at > now()"}
                     ORDER BY depth, created_at""",
             )
+
+    async def mandate_impact(self, request: Request, _h: str) -> Any:
+        return await self.admin.revoke_mandate_impact(request.path_params["mandate_id"])
 
     async def tasks(self, request: Request, _h: str) -> Any:
         q = request.query_params
@@ -204,7 +211,7 @@ class AdminApi:
             return await fetchall(
                 conn,
                 f"""SELECT id, project_id, title, body, action, status, created_by, delegate_to, assignee, deferred,
-                           defer_reason, needed_scope, result, approved_by, approved_at, claimed_at, parent_task_id,
+                           defer_reason, needed_scope, answer, result, approved_by, approved_at, claimed_at, parent_task_id,
                            created_at, updated_at
                     FROM tasks WHERE {" AND ".join(where)} ORDER BY updated_at DESC LIMIT 200""",
                 params,
@@ -371,7 +378,8 @@ class AdminApi:
         if decision in ("approve", "reject"):
             await self.admin.approve_task(task_id, by=human, approve=decision == "approve")
         elif decision == "resume":
-            await self.admin.resume_task(task_id, by=human)
+            answer = str((await _body(request)).get("answer") or "").strip() or None
+            await self.admin.resume_task(task_id, by=human, answer=answer)
         elif decision == "assign":
             agent = (await _body(request)).get("agent") or None
             return {"ok": True, **await self.admin.assign_task(task_id, agent, by=human)}
@@ -418,6 +426,7 @@ def build_admin_app(pool: AsyncConnectionPool[Conn], verifier: Verifier) -> Star
             Route(f"{p}/agents/{{agent_id}}/tokens", r(a.revoke_tokens), methods=["DELETE"]),
             Route(f"{p}/mandates", r(a.mandates)),
             Route(f"{p}/mandates", r(a.issue_mandate), methods=["POST"]),
+            Route(f"{p}/mandates/{{mandate_id}}/impact", r(a.mandate_impact)),
             Route(f"{p}/mandates/{{mandate_id}}/revoke", r(a.revoke_mandate), methods=["POST"]),
             Route(f"{p}/tasks", r(a.tasks)),
             Route(f"{p}/tasks/{{task_id}}", r(a.task_trace)),

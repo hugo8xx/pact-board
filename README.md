@@ -92,6 +92,10 @@ tokens minted for agent URLs are refused. Roles: owners do everything (kill swit
 flag, freezing, banning); approvers approve tasks, register agents and issue or revoke mandates;
 viewers read. The UI lives in its own repo, [hugo8xx/pact-admin](https://github.com/hugo8xx/pact-admin).
 
+Before revoking, `GET /admin/api/mandates/{id}/impact` shows what would go with it (mandates below,
+open tasks that get canceled, agents that lose authority) without changing anything. Resuming a
+deferred task takes an optional `answer`, which the agent then sees on the task in `pact_list`.
+
 ## Configuration
 
 | Variable | Required | Meaning |
