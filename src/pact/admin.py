@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from psycopg_pool import AsyncConnectionPool
 
-from .board import Client, agent_projects
+from .board import Client, agent_projects, revoke_closed_task_mandates
 from .crypto import new_token, sha256
 from .db import Conn, fetchall, fetchone, transaction
 from .entries import SYSTEM_CHAIN, EntryInput, append_entry, erase_payload, verify_entry_chain
@@ -225,6 +225,7 @@ class Admin:
                 raise PactError("not_found", f"mandate {mandate_id} does not exist")
             r = await revoke_subtree(conn, mandate_id)
             await self._log(conn, by, "admin.mandate.revoke", {"mandate_id": mandate_id}, mandate_chain=[mandate_id])
+            await revoke_closed_task_mandates(conn, [tid for tid, _ in r["stopped"]])
             return {"descendant_mandates": r["descendant_mandates"], "tasks_stopped": r["tasks_stopped"]}
 
     async def set_agent_status(self, agent_id: str, status: Literal["active", "paused", "banned"], *, by: str) -> None:
@@ -253,6 +254,8 @@ class Admin:
             if row is None:
                 raise PactError("invalid_request", f"task {task_id} is not waiting for approval")
             await self._log(conn, by, "admin.task.approve", {"approve": approve}, project_id=row["project_id"], task_id=task_id)
+            if not approve:
+                await revoke_closed_task_mandates(conn, [task_id])
 
     async def resume_task(self, task_id: str, *, by: str) -> None:
         """Put a deferred task back on the board, unchanged, once a human has decided."""
@@ -283,3 +286,9 @@ class Admin:
                 else [r["chain_key"] for r in await fetchall(conn, "SELECT chain_key FROM entry_chain_heads ORDER BY chain_key")]
             )
             return [(await verify_entry_chain(conn, k)).__dict__ for k in keys or [SYSTEM_CHAIN]]
+
+    async def sweep_closed_task_mandates(self) -> list[dict[str, Any]]:
+        """Revoke mandates still alive under tasks that already closed. Idempotent; runs with
+        every migrate so a deploy cleans up what was left behind."""
+        async with transaction(self.pool) as conn:
+            return await revoke_closed_task_mandates(conn)

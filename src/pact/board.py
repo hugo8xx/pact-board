@@ -23,6 +23,9 @@ ReportStatus = Literal["working", "completed", "failed", "canceled", "input_requ
 POST_ONLY_CLIENTS: tuple[Client, ...] = ("chat", "cowork")
 """Clients that post and watch work; they never claim it."""
 
+TERMINAL_STATUSES = ("completed", "failed", "canceled", "rejected")
+"""A task in one of these is done for good; the mandate delegated for it dies with it."""
+
 T = TypeVar("T")
 
 
@@ -370,7 +373,12 @@ class Board:
                    WHERE id = %(id)s""",
                 {"status": status, "result": Jsonb(result) if result is not None else None, "id": task_id},
             )
-            return {"ok": True, "task_id": task_id, "status": status}
+            out: dict[str, Any] = {"ok": True, "task_id": task_id, "status": status}
+            closed = await revoke_closed_task_mandates(conn, [task_id])
+            if closed:
+                out["revoked_mandate"] = closed[0]["mandate_id"]
+                out["subtasks_canceled"] = sum(len(c["tasks_stopped"]) for c in closed)
+            return out
 
         return await self._call(agent, "pact_report", payload, run)
 
@@ -415,6 +423,7 @@ class Board:
                     "not_issuer", f"agent {agent.id} did not issue mandate {target.id}; revoke it in the Admin UI", target.id
                 )
             r = await revoke_subtree(conn, target.id)
+            await revoke_closed_task_mandates(conn, [tid for tid, _ in r["stopped"]])
             return {"revoked": target.id, "descendant_mandates": r["descendant_mandates"], "tasks_stopped": r["tasks_stopped"]}
 
         return await self._call(agent, "pact_revoke", {"mandate_id": mandate_id}, run)
@@ -514,6 +523,69 @@ async def _get_task(conn: Conn, task_id: str) -> dict[str, Any] | None:
 async def _requires_approval(conn: Conn, action: str) -> bool:
     rows = await fetchall(conn, "SELECT action FROM approval_actions")
     return any(action_covers(r["action"], action) for r in rows)
+
+
+async def revoke_closed_task_mandates(conn: Conn, task_ids: list[str] | None = None) -> list[dict[str, Any]]:
+    """Revoke the mandate delegated for each closed task, and everything under it.
+
+    A task in a terminal status needs no more authority, so the child mandate issued for it
+    must not outlive it. Open tasks posted under that mandate are canceled, as with any
+    revoke; each of those is closed in turn, so the sweep continues down the tree. Tasks that
+    are still open (deferred, waiting for approval, …) keep their mandate. ``None`` sweeps
+    every closed task, for mandates left behind before this rule existed.
+    """
+    done: list[dict[str, Any]] = []
+    queue = task_ids
+    while queue is None or queue:
+        rows = await fetchall(
+            conn,
+            f"""WITH RECURSIVE up AS (
+                  SELECT t.id AS task_id, m.id, m.parent_id, m.revoked_at
+                  FROM tasks t JOIN mandates m ON m.id = t.delegated_mandate_id
+                  WHERE t.status = ANY(%(terminal)s) {"" if queue is None else "AND t.id = ANY(%(ids)s::uuid[])"}
+                  UNION ALL
+                  SELECT up.task_id, p.id, p.parent_id, p.revoked_at FROM mandates p JOIN up ON p.id = up.parent_id
+                )
+                SELECT t.id, t.project_id, t.status, t.delegated_mandate_id FROM tasks t
+                WHERE t.id IN (SELECT task_id FROM up GROUP BY task_id HAVING bool_and(revoked_at IS NULL))
+                ORDER BY t.change_seq""",
+            {"terminal": list(TERMINAL_STATUSES), "ids": queue or []},
+        )
+        queue = []
+        for r in rows:
+            mandate_id = str(r["delegated_mandate_id"])
+            revoked = await revoke_subtree(conn, mandate_id)
+            stopped = [tid for tid, _ in revoked["stopped"]]
+            lineage = await fetchall(
+                conn,
+                """WITH RECURSIVE up AS (
+                     SELECT id, parent_id, depth FROM mandates WHERE id = %s
+                     UNION ALL
+                     SELECT p.id, p.parent_id, p.depth FROM mandates p JOIN up ON p.id = up.parent_id
+                   ) SELECT id::text FROM up ORDER BY depth""",
+                (mandate_id,),
+            )
+            await append_entry(
+                conn,
+                EntryInput(
+                    project_id=r["project_id"],
+                    task_id=str(r["id"]),
+                    agent_id=None,
+                    actor="system",
+                    mandate_chain=[m["id"] for m in lineage],
+                    action="mandate.revoke_on_close",
+                    payload={
+                        "task_status": r["status"],
+                        "mandate_id": mandate_id,
+                        "descendant_mandates": revoked["descendant_mandates"],
+                        "tasks_stopped": stopped,
+                    },
+                    outcome="ok",
+                ),
+            )
+            done.append({"task_id": str(r["id"]), "mandate_id": mandate_id, "tasks_stopped": stopped})
+            queue.extend(stopped)
+    return done
 
 
 async def release_stale(conn: Conn, project_ids: list[str]) -> int:
