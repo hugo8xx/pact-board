@@ -20,6 +20,9 @@ then by the token's `sub`.
 ## Tools
 
 `pact_whoami` · `pact_post` · `pact_list` · `pact_claim` · `pact_report` · `pact_defer` · `pact_revoke`.
+A mandate delegated with `pact_post` lives only as long as its task: once the task is completed,
+failed, canceled or rejected, that mandate and everything under it is revoked, and open subtasks
+posted under it are canceled. `pact-admin migrate` sweeps any left over from before this rule.
 Refusals come back as `is_error` results whose text is JSON: `{"error": "<code>", "message": …, "mandate_id": …}`.
 
 ## Run locally

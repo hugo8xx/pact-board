@@ -22,7 +22,7 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pact-admin", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("migrate", help="apply database migrations")
+    sub.add_parser("migrate", help="apply database migrations, then revoke mandates of closed tasks")
 
     h = sub.add_parser("human-add", help="add a person (the first one becomes the bootstrap owner)")
     h.add_argument("id")
@@ -100,7 +100,9 @@ async def _run(args: argparse.Namespace) -> Any:
     await pool.open()
     try:
         if args.cmd == "migrate":
-            return {"applied": await migrate(pool)}
+            applied = await migrate(pool)
+            swept = await Admin(pool).sweep_closed_task_mandates()
+            return {"applied": applied, "closed_task_mandates_revoked": [s["mandate_id"] for s in swept]}
         a = Admin(pool)
         match args.cmd:
             case "human-add":

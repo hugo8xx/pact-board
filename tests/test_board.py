@@ -143,7 +143,7 @@ async def test_entries_trace_back_to_the_human_root(world: World) -> None:
 
     async with transaction(world.pool) as conn:
         entries = await fetchall(conn, "SELECT mandate_chain FROM entries WHERE task_id = %s", (t["task_id"],))
-        assert len(entries) == 3
+        assert len(entries) == 4  # post, claim, report, and the delegated mandate revoked on close
         for e in entries:
             root = await fetchone(
                 conn, "SELECT issuer_kind, issuer, parent_id FROM mandates WHERE id = %s", (e["mandate_chain"][0],)
@@ -521,3 +521,110 @@ async def test_every_tool_under_five_seconds_with_1000_tasks_and_depth_5(world: 
     await timed("defer", world.board.defer(deepest, task_id=other, reason="r", mandate_id=mandate))
     await timed("revoke", refused(world.board.revoke(deepest, mandate_id=world.roots["a0"]), "not_issuer"))
     assert max(timings.values()) < 5, timings
+
+
+# ── mandates die with their task ──────────────────────────────────────────────
+
+
+async def delegate(w: World, to: str, title: str = "job", **kw: Any) -> dict[str, Any]:
+    return await w.board.post(
+        w.agents["chat-boss"], project_id="web", title=title, mandate_id=w.roots["chat-boss"], delegate_to=to, **kw
+    )
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "canceled"])
+async def test_closing_a_task_revokes_its_delegated_mandate(world: World, status: str) -> None:
+    await setup_web(world)
+    code = world.agents["code-web"]
+    t = await delegate(world, "code-web")
+    child = t["delegated_mandate_id"]
+    await world.board.claim(code, task_id=t["task_id"], mandate_id=child)
+    out = await world.board.report(code, task_id=t["task_id"], status=status, mandate_id=child)  # type: ignore[arg-type]
+    assert out["revoked_mandate"] == child
+
+    err = await refused(world.board.list_tasks(code, mandate_id=child), "mandate_revoked")
+    assert err.mandate_id == child
+    await world.board.list_tasks(code, mandate_id=world.roots["code-web"])  # its own root is untouched
+
+    async with transaction(world.pool) as conn:
+        entry = await fetchone(
+            conn,
+            "SELECT actor, mandate_chain FROM entries WHERE action = 'mandate.revoke_on_close' AND task_id = %s",
+            (t["task_id"],),
+        )
+    assert entry is not None and entry["actor"] == "system"
+    assert [str(m) for m in entry["mandate_chain"]] == [world.roots["chat-boss"], child]  # traceable to the human
+
+
+async def test_rejecting_a_task_revokes_its_delegated_mandate(world: World) -> None:
+    await setup_web(world)
+    t = await delegate(world, "code-web", action="deploy.web", child_scope=[board_scope("task.read", "web")])
+    assert t["status"] == "auth_required"
+    await world.board.list_tasks(world.agents["code-web"], mandate_id=t["delegated_mandate_id"])
+    await world.admin.approve_task(t["task_id"], by="boss", approve=False)
+    await refused(world.board.list_tasks(world.agents["code-web"], mandate_id=t["delegated_mandate_id"]), "mandate_revoked")
+
+
+async def test_open_tasks_keep_their_mandate_through_defer_and_approval(world: World) -> None:
+    await setup_web(world)
+    code = world.agents["code-web"]
+    t = await delegate(world, "code-web")
+    child = t["delegated_mandate_id"]
+    await world.board.claim(code, task_id=t["task_id"], mandate_id=child)
+    await world.board.defer(code, task_id=t["task_id"], reason="needs a human", mandate_id=child)
+    await world.admin.resume_task(t["task_id"], by="boss")
+    await world.board.claim(code, task_id=t["task_id"], mandate_id=child)  # the same mandate still works
+    await world.board.report(code, task_id=t["task_id"], status="input_required", mandate_id=child)
+    await world.board.list_tasks(code, mandate_id=child)
+
+    gated = await delegate(world, "code-web", action="deploy.web", child_scope=[board_scope("task.read", "web")])
+    assert gated["status"] == "auth_required"
+    await world.admin.approve_task(gated["task_id"], by="boss")
+    await world.board.list_tasks(code, mandate_id=gated["delegated_mandate_id"])
+
+
+async def test_closing_a_task_reaches_grandchildren_and_cancels_open_subtasks(world: World) -> None:
+    await world.project("web")
+    await world.agent("chat-boss", "chat", ["web"], delegations=3, scope=[board_scope("task.*", "web")])
+    await world.agent("code-a", "code", ["web"])
+    await world.agent("code-b", "gemini", ["web"])
+    a, b = world.agents["code-a"], world.agents["code-b"]
+    parent = await world.board.post(
+        world.agents["chat-boss"],
+        project_id="web",
+        title="parent",
+        mandate_id=world.roots["chat-boss"],
+        delegate_to="code-a",
+        child_scope=[board_scope("task.*", "web")],
+    )
+    child = parent["delegated_mandate_id"]
+    await world.board.claim(a, task_id=parent["task_id"], mandate_id=child)
+    sub = await world.board.post(
+        a, project_id="web", title="sub", mandate_id=child, delegate_to="code-b", parent_task_id=parent["task_id"]
+    )
+    grandchild = sub["delegated_mandate_id"]
+    await world.board.claim(b, task_id=sub["task_id"], mandate_id=grandchild)
+
+    out = await world.board.report(a, task_id=parent["task_id"], status="completed", mandate_id=child)
+    assert out["subtasks_canceled"] == 1
+    await refused(world.board.list_tasks(b, mandate_id=grandchild), "mandate_revoked")
+    await refused(world.board.report(b, task_id=sub["task_id"], status="completed", mandate_id=grandchild), "mandate_revoked")
+    async with transaction(world.pool) as conn:
+        row = await fetchone(conn, "SELECT status, result FROM tasks WHERE id = %s", (sub["task_id"],))
+    assert row == {"status": "canceled", "result": {"reason": "mandate_revoked", "mandate_id": child}}
+
+
+async def test_sweep_revokes_mandates_left_behind_by_closed_tasks(world: World) -> None:
+    await setup_web(world)
+    done = await delegate(world, "code-web", title="closed before the rule")
+    still_open = await delegate(world, "code-web", title="still open")
+    async with transaction(world.pool) as conn:  # how the board looked before this rule existed
+        await conn.execute("UPDATE tasks SET status = 'completed' WHERE id = %s", (done["task_id"],))
+
+    swept = await world.admin.sweep_closed_task_mandates()
+    assert [s["mandate_id"] for s in swept] == [done["delegated_mandate_id"]]
+    assert await world.admin.sweep_closed_task_mandates() == []  # idempotent
+    code = world.agents["code-web"]
+    await refused(world.board.list_tasks(code, mandate_id=done["delegated_mandate_id"]), "mandate_revoked")
+    await world.board.list_tasks(code, mandate_id=still_open["delegated_mandate_id"])
+    assert all(v["ok"] for v in await world.admin.verify_log())
