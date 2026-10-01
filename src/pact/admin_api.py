@@ -18,6 +18,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from . import context as notes
 from .admin import Admin
 from .db import Conn, fetchall, fetchone, transaction
 from .errors import PactError
@@ -33,6 +34,7 @@ _STATUS = {
     "project_mismatch": 400,
     "scope_exceeded": 400,
     "limit_exceeded": 400,
+    "note_pinned": 409,
 }
 
 
@@ -284,6 +286,35 @@ class AdminApi:
         )
         return {"ok": True}
 
+    async def context_list(self, request: Request, _h: str) -> Any:
+        async with transaction(self.pool) as conn:
+            return await notes.list_notes(
+                conn, request.path_params["project_id"], archived=request.query_params.get("archived") == "1"
+            )
+
+    async def context_note(self, request: Request, _h: str) -> Any:
+        p, k = request.path_params["project_id"], request.path_params["key"]
+        async with transaction(self.pool) as conn:
+            return {"note": await notes.read_note(conn, p, k, archived=True), "versions": await notes.versions(conn, p, k)}
+
+    async def context_write(self, request: Request, human: str) -> Any:
+        b = await _body(request)
+        return await self.admin.write_note(
+            request.path_params["project_id"], request.path_params["key"], by=human, title=b.get("title"), body=b.get("body")
+        )
+
+    async def context_action(self, request: Request, human: str) -> Any:
+        p, k, action = request.path_params["project_id"], request.path_params["key"], request.path_params["action"]
+        if action in ("pin", "unpin"):
+            await self.admin.pin_note(p, k, action == "pin", by=human)
+            return {"ok": True}
+        if action == "archive":
+            return await self.admin.write_note(p, k, by=human, archive=True)
+        raise PactError("not_found", f"unknown action {action}")
+
+    async def context_erase(self, request: Request, human: str) -> Any:
+        return await self.admin.erase_note_version(int(request.path_params["version_id"]), by=human)
+
     async def register_agent(self, request: Request, human: str) -> Any:
         b = await _body(request)
         return await self.admin.register_agent(
@@ -359,6 +390,11 @@ def build_admin_app(pool: AsyncConnectionPool[Conn], verifier: Verifier) -> Star
             Route(f"{p}/projects", r(a.projects)),
             Route(f"{p}/projects", r(a.add_project), methods=["POST"]),
             Route(f"{p}/projects/{{project_id}}", r(a.update_project), methods=["PATCH"]),
+            Route(f"{p}/projects/{{project_id}}/context", r(a.context_list)),
+            Route(f"{p}/projects/{{project_id}}/context/{{key}}", r(a.context_note)),
+            Route(f"{p}/projects/{{project_id}}/context/{{key}}", r(a.context_write), methods=["PUT"]),
+            Route(f"{p}/projects/{{project_id}}/context/{{key}}/{{action}}", r(a.context_action), methods=["POST"]),
+            Route(f"{p}/context-versions/{{version_id:int}}/erase", r(a.context_erase), methods=["POST"]),
             Route(f"{p}/agents", r(a.agents)),
             Route(f"{p}/agents", r(a.register_agent), methods=["POST"]),
             Route(f"{p}/agents/{{agent_id}}/status", r(a.agent_status), methods=["POST"]),

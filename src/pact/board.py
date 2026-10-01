@@ -1,4 +1,4 @@
-"""The seven board tools, as plain async methods. The MCP layer only maps arguments onto them."""
+"""The eight board tools, as plain async methods. The MCP layer only maps arguments onto them."""
 
 import json
 import os
@@ -10,6 +10,7 @@ from uuid import uuid4
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from . import context as notes
 from .crypto import iso
 from .db import Conn, fetchall, fetchone, transaction
 from .entries import EntryInput, append_entry
@@ -141,7 +142,13 @@ class Board:
             )
             return {
                 "agent": {"id": agent.id, "client": agent.client, "owner": agent.owner},
-                "projects": [p.__dict__ for p in projects],
+                "projects": [
+                    {
+                        **p.__dict__,
+                        "context": [{"key": n["key"], "title": n["title"]} for n in await notes.list_notes(conn, p.id)],
+                    }
+                    for p in projects
+                ],
                 "mandates": [
                     {
                         **m,
@@ -477,21 +484,13 @@ class Board:
         Reads like ``pact_list(filter="open", since=…)`` under the agent's own mandate, with the
         cursor kept on the board per session. It only reports; it never claims.
         """
+        mandate_id = await self.default_mandate(agent)
         async with transaction(self.pool) as conn:
-            mandate = await fetchone(
-                conn,
-                """SELECT m.id::text FROM mandates m JOIN agents a ON a.id = m.holder
-                   WHERE m.holder = %s AND m.revoked_at IS NULL AND m.expires_at > now()
-                   ORDER BY (m.id = a.root_mandate_id) DESC, m.depth, m.created_at LIMIT 1""",
-                (agent.id,),
-            )
             cursor = await fetchone(
                 conn, "SELECT since FROM hook_cursors WHERE agent_id = %s AND session_id = %s", (agent.id, session_id)
             )
-        if mandate is None:
-            raise PactError("mandate_expired", f"agent {agent.id} holds no live mandate")
         listed = await self.list_tasks(
-            agent, mandate_id=mandate["id"], filter="open", since=cursor["since"] if cursor else None, limit=50
+            agent, mandate_id=mandate_id, filter="open", since=cursor["since"] if cursor else None, limit=50
         )
         async with transaction(self.pool) as conn:
             await conn.execute(
@@ -501,6 +500,63 @@ class Board:
             )
             await conn.execute("DELETE FROM hook_cursors WHERE updated_at < now() - interval '30 days'")
         return listed
+
+    # ── project context (the eighth tool, pact_note) ─────────────────────────
+
+    async def note(
+        self,
+        agent: Agent,
+        *,
+        mandate_id: str,
+        project_id: str,
+        key: str | None = None,
+        title: str | None = None,
+        body: str | None = None,
+        archive: bool = False,
+    ) -> dict[str, Any]:
+        """Read or write project context. No key: the list. Key only: one note. With a body, or
+        ``archive``: a write, which needs ``context.write``; reading needs ``task.read``."""
+        writing = body is not None or archive
+        payload = {
+            "project_id": project_id,
+            "key": key,
+            "title": title,
+            "body": body,
+            "archive": archive,
+            "mandate_id": mandate_id,
+        }
+
+        async def run(conn: Conn, ctx: _CallContext) -> dict[str, Any]:
+            chain = await self._chain(conn, ctx, mandate_id, agent)
+            ctx.project_id = project_id
+            project = await self._project_for(conn, agent, project_id)
+            _require_scope(chain, board_scope("context.write" if writing else "task.read", project.id))
+            if not writing:
+                if key is None:
+                    return {"project_id": project.id, "notes": await notes.list_notes(conn, project.id), "notice": notes.NOTICE}
+                return {"note": await notes.read_note(conn, project.id, key), "notice": notes.NOTICE}
+            if project.frozen:
+                raise PactError("project_frozen", f"project {project.id} is frozen")
+            _refuse_runner_on_production(agent, project)
+            if key is None:
+                raise PactError("invalid_request", "writing a note needs a key")
+            return await notes.write_note(conn, project.id, key, by=f"agent:{agent.id}", title=title, body=body, archive=archive)
+
+        return await self._call(agent, "pact_note", payload, run)
+
+    async def default_mandate(self, agent: Agent) -> str:
+        """The agent's own live mandate, for calls that cannot carry one (hooks, MCP resources)."""
+        async with transaction(self.pool) as conn:
+            row = await fetchone(
+                conn,
+                """SELECT m.id::text FROM mandates m JOIN agents a ON a.id = m.holder
+                   WHERE m.holder = %s AND m.revoked_at IS NULL AND m.expires_at > now()
+                   ORDER BY (m.id = a.root_mandate_id) DESC, m.depth, m.created_at LIMIT 1""",
+                (agent.id,),
+            )
+        if row is None:
+            raise PactError("mandate_expired", f"agent {agent.id} holds no live mandate")
+        return str(row["id"])
 
     # ── helpers ──────────────────────────────────────────────────────────────
 

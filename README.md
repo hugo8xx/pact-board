@@ -8,7 +8,7 @@ to a human, checked on every call, narrowing at each hand-off, revocable at any 
 
 | Piece | What it is |
 | --- | --- |
-| `pact-board` (this repo) | the MCP server: 7 tools, mandates, the append-only hash-chained log |
+| `pact-board` (this repo) | the MCP server: 8 tools, project context, mandates, the append-only hash-chained log |
 | An OAuth 2.1 authorization server | signs people in for the hosted Claude apps. Bring any that issues JWT access tokens with a JWKS and supports CIMD or DCR (Keycloak, WorkOS, Auth0, …) |
 | Agent tokens | `pact_…` bearer tokens for Claude Code, Gemini CLI, hooks and the Runner — no OAuth needed |
 | [`pact-admin`](https://github.com/hugo8xx/pact-admin) (separate repo) | the Admin UI (Next.js, on Vercel). It calls the board's Admin API at `/admin/api` |
@@ -19,7 +19,15 @@ then by the token's `sub`.
 
 ## Tools
 
-`pact_whoami` · `pact_post` · `pact_list` · `pact_claim` · `pact_report` · `pact_defer` · `pact_revoke`.
+`pact_whoami` · `pact_post` · `pact_list` · `pact_claim` · `pact_report` · `pact_defer` · `pact_revoke` · `pact_note`.
+
+**Project context.** `pact_note` holds a project's shared knowledge (decisions, conventions, links) so
+every agent reads the same thing without anyone retelling it. Reading needs `task.read`; writing needs
+`context.write@project:<p>`, which a fresh registration does not grant. A note a person pins in the Admin
+UI is read-only for agents. Notes are redacted, versioned, erasable (PDPA), and served as reference data
+with their author, never as instructions. They are also MCP resources:
+`pact://projects/<p>/context` and `pact://projects/<p>/context/<key>`. `pact_whoami` lists their titles.
+
 A mandate delegated with `pact_post` lives only as long as its task: once the task is completed,
 failed, canceled or rejected, that mandate and everything under it is revoked, and open subtasks
 posted under it are canceled. `pact-admin migrate` sweeps any left over from before this rule.
@@ -113,7 +121,8 @@ The test suite drops and recreates the `public` schema of the test database on e
 
 | Path | What |
 | --- | --- |
-| `src/pact/board.py` | the 7 tools as plain async methods |
+| `src/pact/board.py` | the 8 tools as plain async methods |
+| `src/pact/context.py` | project context notes |
 | `src/pact/mandates.py` | issuing, whole-chain verification, aggregate limits, revocation |
 | `src/pact/entries.py` | append-only log, one hash chain per project, PDPA payload erasure |
 | `src/pact/admin.py` | human-only operations (the Admin UI backend) |

@@ -154,3 +154,18 @@ async def test_audit_log_filters_by_time(world: World, board: tuple[str, Resourc
     naive = await api(url, "GET", query(**{"from": "2026-09-02T00:00:00"}), boss)
     assert naive.status_code == 400 and "offset" in naive.json()["message"]
     assert (await api(url, "GET", query(to="yesterday"), boss)).status_code == 400
+
+
+async def test_people_manage_project_context(world: World, board: tuple[str, ResourceSettings], issuer: Issuer) -> None:
+    url, settings = board
+    await people(world)
+    boss, vic = admin_token(issuer, settings), admin_token(issuer, settings, who="vic")
+    path = "/projects/web/context/conventions"
+    assert (await api(url, "PUT", path, vic, {"body": "x"})).status_code == 403  # viewers read only
+    wrote = (await api(url, "PUT", path, boss, {"title": "Conventions", "body": "Conventional Commits."})).json()
+    assert wrote["version"] == 1
+    assert (await api(url, "POST", f"{path}/pin", boss)).json() == {"ok": True}
+    listed = (await api(url, "GET", "/projects/web/context", vic)).json()
+    assert [(n["key"], n["pinned"]) for n in listed] == [("conventions", True)]
+    detail = (await api(url, "GET", path, vic)).json()
+    assert detail["note"]["updated_by"] == "human:boss" and [v["version"] for v in detail["versions"]] == [1]
