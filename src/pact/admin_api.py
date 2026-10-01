@@ -52,6 +52,18 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _instant(name: str, value: str) -> datetime:
+    """An ISO 8601 instant with its offset. A bare local time would be read in the server's zone,
+    which is never what the person meant."""
+    try:
+        at = datetime.fromisoformat(value.strip().replace(" ", "+"))
+    except ValueError:
+        raise PactError("invalid_request", f"{name} must be an ISO 8601 time, e.g. 2026-10-01T09:00:00+07:00") from None
+    if at.tzinfo is None:
+        raise PactError("invalid_request", f"{name} needs a UTC offset (Z or +07:00): {value}")
+    return at
+
+
 def _ok(body: Any, status: int = 200) -> JSONResponse:
     return JSONResponse(_jsonable(body), status_code=status, headers={"Cache-Control": "no-store"})
 
@@ -215,7 +227,7 @@ class AdminApi:
     async def entries(self, request: Request, _h: str) -> Any:
         q = request.query_params
         where: list[str] = ["true"]
-        params: list[str | int] = []
+        params: list[str | int | datetime] = []
         for key, column in (
             ("project", "e.project_id"),
             ("agent", "e.agent_id"),
@@ -233,6 +245,10 @@ class AdminApi:
         if q.get("before"):
             where.append("e.id < %s")
             params.append(int(q["before"]))
+        for key, op in (("from", ">="), ("to", "<")):
+            if q.get(key):
+                where.append(f"e.at {op} %s")
+                params.append(_instant(key, q[key]))
         limit = min(int(q.get("limit") or 100), 500)
         async with transaction(self.pool) as conn:
             return await fetchall(

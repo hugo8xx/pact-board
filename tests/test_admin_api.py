@@ -124,3 +124,33 @@ async def test_refused_calls_show_in_the_audit_log(world: World, board: tuple[st
     assert [(r["agent_id"], r["outcome"]) for r in rows] == [("code-web", "not_issuer")]
     verdicts = (await api(url, "GET", "/log/verify", admin_token(issuer, settings))).json()
     assert verdicts and all(v["ok"] for v in verdicts)
+
+
+async def test_audit_log_filters_by_time(world: World, board: tuple[str, ResourceSettings], issuer: Issuer) -> None:
+    from pact.db import transaction
+
+    url, settings = board
+    await people(world)
+    boss = admin_token(issuer, settings)
+    async with transaction(world.pool) as conn:  # spread the entries over three days
+        await conn.execute("ALTER TABLE entries DISABLE TRIGGER entries_no_update")
+        await conn.execute("UPDATE entries SET at = '2026-09-01T12:00:00Z'")
+        await conn.execute("ALTER TABLE entries ENABLE TRIGGER entries_no_update")
+    await world.board.whoami(world.agents["code-web"])
+    async with transaction(world.pool) as conn:
+        await conn.execute("ALTER TABLE entries DISABLE TRIGGER entries_no_update")
+        await conn.execute("UPDATE entries SET at = '2026-09-02T12:00:00Z' WHERE action = 'pact_whoami'")
+        await conn.execute("ALTER TABLE entries ENABLE TRIGGER entries_no_update")
+
+    def query(**q: str) -> str:
+        return "/entries?" + "&".join(f"{k}={v}" for k, v in q.items())
+
+    day2 = (await api(url, "GET", query(**{"from": "2026-09-02T00:00:00Z", "to": "2026-09-03T00:00:00Z"}), boss)).json()
+    assert [e["action"] for e in day2] == ["pact_whoami"]
+    # +07:00 sent unencoded arrives as a space; it still reads as the offset.
+    bkk = (await api(url, "GET", query(to="2026-09-02T07:00:00+07:00"), boss)).json()
+    assert bkk and all(e["action"] != "pact_whoami" for e in bkk)
+
+    naive = await api(url, "GET", query(**{"from": "2026-09-02T00:00:00"}), boss)
+    assert naive.status_code == 400 and "offset" in naive.json()["message"]
+    assert (await api(url, "GET", query(to="yesterday"), boss)).status_code == 400
