@@ -96,6 +96,9 @@ viewers read. The UI lives in its own repo, [hugo8xx/pact-admin](https://github.
 | `PACT_PUBLIC_URL` | yes in production | this server's public URL, e.g. `https://board.example.com` |
 | `PACT_AUTH_ISSUER` | for the hosted Claude apps | your authorization server's issuer URL; unset = agent tokens only |
 | `PACT_ADMIN_REQUIRE_MFA` | no | default `1`; set `0` only if your issuer never reports `amr` |
+| `PACT_ROLE` | no | `admin` runs the Admin API service (`pact-admin-api`) instead of the board |
+| `PACT_ADMIN_AUDIENCE` | Admin API service | audience of Admin API tokens; set it to `<board URL>/admin` so tokens stay the same |
+| `PACT_ADMIN_API` | no | default `on`; `off` makes the board stop serving `/admin/api` once the Admin API service is live |
 | `PORT`, `HOST` | no | default `8787`, `127.0.0.1` (`0.0.0.0` in the container) |
 
 ## Deploy on Railway
@@ -107,6 +110,11 @@ viewers read. The UI lives in its own repo, [hugo8xx/pact-admin](https://github.
 4. Deploy. Migrations run on start. Then, from your machine with the same `DATABASE_URL`
    (Railway shows a public proxy URL), run the `pact-admin` commands above.
 5. In Claude: *Settings → Connectors → Add custom connector* → `https://<domain>/mcp/a/<agent-id>`.
+6. The Admin API runs as a second service from the same repo, so the kill switch keeps working when the
+   MCP side is down: add a service from this repo with `PACT_ROLE=admin`, the same `DATABASE_URL`,
+   `PACT_SIGNING_KEY` and `PACT_AUTH_ISSUER` (Railway reference variables), `PACT_ADMIN_AUDIENCE=<board URL>/admin`,
+   and its own public domain in `PACT_PUBLIC_URL`. Point the Admin UI's `PACT_ADMIN_API_URL` at it, then set
+   `PACT_ADMIN_API=off` on the board.
 
 ## Checks
 
@@ -126,6 +134,7 @@ The test suite drops and recreates the `public` schema of the test database on e
 | `src/pact/mandates.py` | issuing, whole-chain verification, aggregate limits, revocation |
 | `src/pact/entries.py` | append-only log, one hash chain per project, PDPA payload erasure |
 | `src/pact/admin.py` | human-only operations (the Admin UI backend) |
+| `src/pact/admin_server.py` | the Admin API as its own service (`pact-admin-api`) |
 | `src/pact/oauth.py` | the board as an OAuth protected resource (RFC 9728, JWKS verification) |
 | `src/pact/server.py` | MCP tools, `/mcp/a/<agent>` routing, agent-token and OAuth auth |
 | `src/pact/hooks.py` | the Claude Code hook endpoints |

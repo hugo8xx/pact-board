@@ -13,5 +13,6 @@ ENV PATH="/app/.venv/bin:$PATH" HOST=0.0.0.0
 RUN useradd --create-home app
 USER app
 
-# Migrations are idempotent; running them on start keeps deploys one step.
-CMD ["sh", "-c", "pact-admin migrate && exec pact-board"]
+# One image, two services. PACT_ROLE=admin runs the Admin API on its own; otherwise the board,
+# which runs the (idempotent) migrations on start so deploys stay one step.
+CMD ["sh", "-c", "if [ \"$PACT_ROLE\" = admin ]; then exec pact-admin-api; else pact-admin migrate && exec pact-board; fi"]

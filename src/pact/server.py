@@ -5,6 +5,7 @@ the request; tools read that agent off the request. Agents never pass their own 
 """
 
 import json
+import os
 import re
 from typing import Annotated, Any, cast
 from urllib.parse import urlsplit
@@ -234,6 +235,15 @@ def build_mcp(board: Board) -> MCPServer:
 
 
 _AGENT_PATH = re.compile(r"^/mcp/a/([a-z0-9][a-z0-9-]{0,62})/?$")
+
+
+def admin_api_on_board() -> bool:
+    """Whether this process still serves /admin/api. The Admin API runs as its own service
+    (``pact-admin-api``) so the kill switch works when the MCP side is down; set
+    ``PACT_ADMIN_API=off`` on the board once the Admin UI talks to that service."""
+    return os.environ.get("PACT_ADMIN_API", "on").lower() not in ("off", "0", "false", "no")
+
+
 _HOOK_PATH = re.compile(r"^/hooks/a/([a-z0-9][a-z0-9-]{0,62})/([a-z-]+)$")
 _METADATA_PATH = re.compile(r"^/\.well-known/oauth-protected-resource/mcp/a/([a-z0-9][a-z0-9-]{0,62})/?$")
 
@@ -266,6 +276,9 @@ class PactApp:
             await _respond(send, 200, {"ok": True})
             return
         if path.startswith("/admin/api/"):
+            if not admin_api_on_board():
+                await _respond(send, 404, {"error": "not_found", "message": "the Admin API runs as its own service"})
+                return
             await self.admin_app(scope, receive, send)
             return
         hook = _HOOK_PATH.match(path)

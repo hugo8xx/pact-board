@@ -16,6 +16,7 @@ dependencies = [
 [project.scripts]
 pact-board = "pact.__main__:main"
 pact-admin = "pact.cli:main"
+pact-admin-api = "pact.admin_server:main"
 
 [build-system]
 requires = ["hatchling"]
