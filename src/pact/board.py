@@ -25,6 +25,31 @@ ListFilter = Literal["mine", "open", "all"]
 ReportStatus = Literal["working", "completed", "failed", "canceled", "input_required"]
 
 POST_ONLY_CLIENTS: tuple[Client, ...] = ("chat", "cowork")
+
+
+@dataclass
+class AutoClaimGate:
+    """What the session's machine reports to the UserPromptSubmit hook. The board cannot see the
+    repo, so the hook script checks the working tree and reads the repo's auto-claim config."""
+
+    enabled: bool = False
+    permission_mode: str = ""
+    git_clean: bool = False
+    allow_from: tuple[str, ...] = ()
+
+    def refusals(self) -> list[str]:
+        out = []
+        if not self.enabled:
+            out.append("auto-claim is off for this repo (PACT_AUTO_CLAIM=1 in the agent's env file turns it on)")
+        if not self.allow_from:
+            out.append("no allowed senders (PACT_AUTO_CLAIM_FROM is empty)")
+        if self.permission_mode != "default":
+            out.append(f"the session is in permission mode {self.permission_mode or 'unknown'!r}, not 'default'")
+        if not self.git_clean:
+            out.append("the working tree has uncommitted or staged changes")
+        return out
+
+
 """Clients that post and watch work; they never claim it."""
 
 TERMINAL_STATUSES = ("completed", "failed", "canceled", "rejected")
@@ -324,7 +349,10 @@ class Board:
 
         return await self._call(agent, "pact_list", payload, run)
 
-    async def claim(self, agent: Agent, *, task_id: str, mandate_id: str) -> dict[str, Any]:
+    async def claim(self, agent: Agent, *, task_id: str, mandate_id: str, exclusive: bool = False) -> dict[str, Any]:
+        """Take a task. With ``exclusive``, only while the agent holds no other task: the check and
+        the claim happen under a lock on the agent, so two sessions of one agent cannot each take one."""
+
         async def run(conn: Conn, ctx: _CallContext) -> dict[str, Any]:
             chain = await self._chain(conn, ctx, mandate_id, agent)
             task = await self._visible_task(conn, ctx, agent, task_id)
@@ -340,6 +368,13 @@ class Board:
                 raise PactError("approval_pending", f"task {task_id} waits for a human approval")
             _require_scope(chain, board_scope(task["action"], project.id))
             await release_stale(conn, [project.id])
+            if exclusive:
+                await conn.execute("SELECT 1 FROM agents WHERE id = %s FOR UPDATE", (agent.id,))
+                busy = await fetchone(
+                    conn, "SELECT id FROM tasks WHERE assignee = %s AND status = 'working' LIMIT 1", (agent.id,)
+                )
+                if busy:
+                    raise PactError("agent_busy", f"agent {agent.id} already works on task {busy['id']}; finish it first")
 
             # Compare-and-set: the row changes only while nobody holds it.
             claimed = await fetchone(
@@ -356,7 +391,8 @@ class Board:
                 raise PactError("invalid_request", f"task {task_id} is {state} and cannot be claimed")
             return {"ok": True, "task_id": task_id, "status": "working"}
 
-        return await self._call(agent, "pact_claim", {"task_id": task_id, "mandate_id": mandate_id}, run)
+        payload = {"task_id": task_id, "mandate_id": mandate_id, "exclusive": exclusive}
+        return await self._call(agent, "pact_claim", payload, run)
 
     async def report(
         self, agent: Agent, *, task_id: str, status: ReportStatus, mandate_id: str, result: Any = None
@@ -529,6 +565,46 @@ class Board:
             )
             await conn.execute("DELETE FROM hook_cursors WHERE updated_at < now() - interval '30 days'")
         return listed
+
+    async def auto_claim(self, agent: Agent, gate: "AutoClaimGate") -> dict[str, Any]:
+        """Claim one task for a Claude Code session when the person types (UserPromptSubmit hook).
+
+        Only when every condition holds: the repo turned auto-claim on, the session asks before
+        acting (permission mode ``default``), the working tree is clean, the agent holds no task,
+        and a task waits that is delegated to this agent by an allowed sender, outside production.
+        Returns the claimed task, or the reasons nothing was claimed.
+        """
+        reasons = gate.refusals()
+        async with transaction(self.pool) as conn:
+            held = await fetchone(
+                conn, "SELECT id, title FROM tasks WHERE assignee = %s AND status = 'working' LIMIT 1", (agent.id,)
+            )
+            # The oldest waiting task from an allowed sender; failing that, any waiting one, only to
+            # tell the person why it was not taken.
+            candidate = await fetchone(
+                conn,
+                """SELECT t.id::text AS id, t.title, t.body, t.created_by, t.project_id,
+                          t.delegated_mandate_id::text AS mandate_id
+                   FROM tasks t JOIN projects p ON p.id = t.project_id
+                   JOIN agent_projects ap ON ap.project_id = t.project_id AND ap.agent_id = %s
+                   WHERE t.delegate_to = %s AND t.status = 'submitted' AND t.assignee IS NULL AND NOT t.deferred
+                     AND t.delegated_mandate_id IS NOT NULL AND NOT p.production AND NOT p.frozen
+                   ORDER BY t.created_by = ANY(%s) DESC, t.created_at LIMIT 1""",
+                (agent.id, agent.id, list(gate.allow_from)),
+            )
+        if held:
+            reasons.append(f"already working on {held['title']!r} ({held['id']})")
+        if candidate is None:
+            return {"claimed": None, "reasons": reasons or ["no task is delegated to this agent"]}
+        if gate.allow_from and candidate["created_by"] not in gate.allow_from:
+            reasons.append(f"its sender {candidate['created_by']} is not in PACT_AUTO_CLAIM_FROM")
+        if reasons:
+            return {"claimed": None, "reasons": reasons, "waiting": {"id": candidate["id"], "title": candidate["title"]}}
+        try:
+            await self.claim(agent, task_id=candidate["id"], mandate_id=candidate["mandate_id"], exclusive=True)
+        except PactError as err:
+            return {"claimed": None, "reasons": [f"the board refused ({err.code}): {err.message}"]}
+        return {"claimed": candidate, "reasons": []}
 
     # ── project context (the eighth tool, pact_note) ─────────────────────────
 

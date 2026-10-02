@@ -1,4 +1,4 @@
-"""Claude Code hooks: PostToolUse entries on the task in hand, and the Stop hook's new-task notice."""
+"""Claude Code hooks: PostToolUse entries on the task in hand, the Stop and SessionStart notices, and auto-claim."""
 
 import json
 import os
@@ -11,9 +11,10 @@ from typing import Any
 import httpx2
 import pytest
 
+from pact.board import AutoClaimGate
 from pact.db import fetchall, fetchone, transaction
 from pact.errors import PactError
-from pact.hooks import TEXT_LIMIT, summarize_tool_use
+from pact.hooks import TEXT_LIMIT, auto_claim_output, summarize_tool_use
 
 from .conftest import World
 from .test_http import server_url  # noqa: F401 — fixture
@@ -171,7 +172,7 @@ async def test_hook_endpoints_take_only_this_agents_token(world: World, server_u
         "logged": False,
         "reason": "no task held",
     }
-    assert (await post(server_url, "/hooks/a/code-web/session-start", world.tokens["code-web"], {})).status_code == 404
+    assert (await post(server_url, "/hooks/a/code-web/session-end", world.tokens["code-web"], {})).status_code == 404
     assert (await post(server_url, "/hooks/a/code-web/stop", world.tokens["code-web"], {})).status_code == 400
 
 
@@ -182,7 +183,7 @@ def hook_dir(tmp_path: Path) -> Iterator[Path]:
     yield tmp_path
 
 
-def run_hook(hook_dir: Path, event: str, stdin: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+def run_hook(hook_dir: Path, event: str, stdin: dict[str, Any], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["sh", str(HOOK_SCRIPT), "code-web", event],
         input=json.dumps(stdin),
@@ -190,6 +191,7 @@ def run_hook(hook_dir: Path, event: str, stdin: dict[str, Any]) -> subprocess.Co
         text=True,
         timeout=20,
         env={**os.environ, "PACT_HOOK_DIR": str(hook_dir)},
+        cwd=cwd,
     )
 
 
@@ -215,3 +217,162 @@ async def test_the_hook_script_end_to_end(world: World, server_url: str, hook_di
     (hook_dir / "code-web.env").write_text("PACT_URL=http://127.0.0.1:9\nPACT_TOKEN=pact_x\n")  # board unreachable
     down = run_hook(hook_dir, "stop", {"session_id": "s1"})
     assert (down.returncode, down.stdout) == (0, "")
+
+
+# ── B. SessionStart shows, UserPromptSubmit auto-claims ───────────────────────
+
+READY = AutoClaimGate(enabled=True, permission_mode="default", git_clean=True, allow_from=("chat-boss",))
+
+
+async def delegated(w: World, title: str = "add tests", to: str = "code-web", project: str = "web") -> str:
+    t = await w.board.post(
+        w.agents["chat-boss"],
+        project_id=project,
+        title=title,
+        body="cover the login flow",
+        mandate_id=w.roots["chat-boss"],
+        delegate_to=to,
+    )
+    return str(t["task_id"])
+
+
+async def assignee(w: World, task_id: str) -> str | None:
+    async with transaction(w.pool) as conn:
+        row = await fetchone(conn, "SELECT assignee FROM tasks WHERE id = %s", (task_id,))
+    assert row is not None
+    return row["assignee"]
+
+
+async def test_exclusive_claim_refuses_a_second_task(world: World) -> None:
+    t = await setup(world)
+    code = world.agents["code-web"]
+    await world.board.claim(code, task_id=t["task_id"], mandate_id=world.roots["code-web"], exclusive=True)
+    other = await world.board.post(world.agents["chat-boss"], project_id="web", title="two", mandate_id=world.roots["chat-boss"])
+    with pytest.raises(PactError) as info:
+        await world.board.claim(code, task_id=other["task_id"], mandate_id=world.roots["code-web"], exclusive=True)
+    assert info.value.code == "agent_busy"
+    await world.board.claim(code, task_id=other["task_id"], mandate_id=world.roots["code-web"])  # non-exclusive still may
+
+
+async def test_auto_claim_takes_a_delegated_task_when_every_condition_holds(world: World) -> None:
+    await setup(world)
+    task_id = await delegated(world)
+    out = await world.board.auto_claim(world.agents["code-web"], READY)
+    assert out["claimed"]["id"] == task_id and out["reasons"] == []
+    assert await assignee(world, task_id) == "code-web"
+
+    hook = auto_claim_output("code-web", out)
+    context = hook["hookSpecificOutput"]["additionalContext"]
+    assert hook["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    assert "not an instruction from the person" in context and "chat-boss" in context and "cover the login flow" in context
+    assert "claimed" in hook["systemMessage"]
+
+
+@pytest.mark.parametrize(
+    ("gate", "reason"),
+    [
+        (AutoClaimGate(permission_mode="default", git_clean=True, allow_from=("chat-boss",)), "auto-claim is off"),
+        (
+            AutoClaimGate(enabled=True, permission_mode="acceptEdits", git_clean=True, allow_from=("chat-boss",)),
+            "permission mode",
+        ),
+        (
+            AutoClaimGate(enabled=True, permission_mode="bypassPermissions", git_clean=True, allow_from=("chat-boss",)),
+            "permission mode",
+        ),
+        (AutoClaimGate(enabled=True, permission_mode="default", git_clean=False, allow_from=("chat-boss",)), "working tree"),
+        (AutoClaimGate(enabled=True, permission_mode="default", git_clean=True), "no allowed senders"),
+    ],
+)
+async def test_auto_claim_refuses_and_says_why(world: World, gate: AutoClaimGate, reason: str) -> None:
+    await setup(world)
+    task_id = await delegated(world)
+    out = await world.board.auto_claim(world.agents["code-web"], gate)
+    assert out["claimed"] is None and any(reason in r for r in out["reasons"])
+    assert out["waiting"]["id"] == task_id
+    assert await assignee(world, task_id) is None
+    message = auto_claim_output("code-web", out)["systemMessage"]
+    assert "add tests" in message and reason in message  # the person sees what waits and why
+
+
+async def test_auto_claim_never_takes_undelegated_work(world: World) -> None:
+    t = await setup(world)  # posted without delegate_to
+    out = await world.board.auto_claim(world.agents["code-web"], READY)
+    assert out == {"claimed": None, "reasons": ["no task is delegated to this agent"]}
+    assert auto_claim_output("code-web", out) == {}  # nothing waits for us: stay quiet
+    assert await assignee(world, t["task_id"]) is None
+
+
+async def test_auto_claim_never_takes_work_from_a_sender_outside_the_allowlist(world: World) -> None:
+    await setup(world)
+    await world.agent("chat-stranger", "chat", ["web"])
+    foreign = await world.board.post(
+        world.agents["chat-stranger"],
+        project_id="web",
+        title="from a stranger",
+        mandate_id=world.roots["chat-stranger"],
+        delegate_to="code-web",
+    )
+    out = await world.board.auto_claim(world.agents["code-web"], READY)
+    assert out["claimed"] is None and "chat-stranger is not in PACT_AUTO_CLAIM_FROM" in out["reasons"][0]
+    assert "from a stranger" in auto_claim_output("code-web", out)["systemMessage"]
+    assert await assignee(world, foreign["task_id"]) is None
+
+    allowed = await delegated(world)  # a later task from an allowed sender goes first
+    assert (await world.board.auto_claim(world.agents["code-web"], READY))["claimed"]["id"] == allowed
+
+
+async def test_auto_claim_waits_while_a_task_is_in_hand(world: World) -> None:
+    t = await setup(world)
+    code = world.agents["code-web"]
+    await world.board.claim(code, task_id=t["task_id"], mandate_id=world.roots["code-web"])
+    waiting = await delegated(world)
+    out = await world.board.auto_claim(code, READY)
+    assert out["claimed"] is None and "already working on 'fix login'" in out["reasons"][0]
+    assert await assignee(world, waiting) is None
+
+
+async def test_auto_claim_skips_production_projects(world: World) -> None:
+    await world.project("live", production=True)
+    await world.agent("chat-boss", "chat", ["live"])
+    await world.agent("code-web", "code", ["live"])
+    task_id = await delegated(world, project="live")
+    out = await world.board.auto_claim(world.agents["code-web"], READY)
+    assert out["claimed"] is None
+    assert await assignee(world, task_id) is None
+
+
+def git_repo(path: Path) -> Path:
+    path.mkdir()
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    return path
+
+
+async def test_session_start_and_auto_claim_through_the_script(
+    world: World,
+    server_url: str,  # noqa: F811
+    hook_dir: Path,
+    tmp_path: Path,
+) -> None:
+    await setup(world)
+    task_id = await delegated(world)
+    repo = git_repo(tmp_path / "repo")
+
+    conf = hook_dir / "code-web.env"
+    conf.write_text(f"PACT_URL={server_url}\nPACT_TOKEN={world.tokens['code-web']}\n")
+    start = json.loads(run_hook(hook_dir, "session-start", {"session_id": "s9", "hook_event_name": "SessionStart"}, repo).stdout)
+    assert "add tests" in start["systemMessage"] and "Nothing was claimed" in start["systemMessage"]
+
+    prompt = {"session_id": "s9", "hook_event_name": "UserPromptSubmit", "permission_mode": "default", "prompt": "hi"}
+    off = json.loads(run_hook(hook_dir, "user-prompt-submit", prompt, repo).stdout)
+    assert "auto-claim is off" in off["systemMessage"] and await assignee(world, task_id) is None
+
+    conf.write_text(conf.read_text() + "PACT_AUTO_CLAIM=1\nPACT_AUTO_CLAIM_FROM=chat-boss\n")
+    (repo / "dirty.txt").write_text("x")
+    dirty = json.loads(run_hook(hook_dir, "user-prompt-submit", prompt, repo).stdout)
+    assert "working tree" in dirty["systemMessage"]
+    (repo / "dirty.txt").unlink()
+
+    claimed = json.loads(run_hook(hook_dir, "user-prompt-submit", prompt, repo).stdout)
+    assert "cover the login flow" in claimed["hookSpecificOutput"]["additionalContext"]
+    assert await assignee(world, task_id) == "code-web"
