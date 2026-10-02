@@ -25,6 +25,7 @@ from .db import Conn, create_pool, transaction
 from .errors import PactError
 from .hooks import EVENTS as HOOK_EVENTS
 from .hooks import handle as handle_hook
+from .notify import SlackSender
 from .oauth import ResourceSettings, TokenRejected, Verifier, agent_for_oauth
 
 INSTRUCTIONS = """\
@@ -275,6 +276,7 @@ class PactApp:
         self.verifier = Verifier(settings)
         self.admin_app = build_admin_app(pool, self.verifier)
         self.board = Board(pool)
+        self.sender = SlackSender.from_env(pool)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -360,9 +362,13 @@ class PactApp:
     async def _lifespan(self, scope: Scope, receive: Receive, send: Send) -> None:
         # Open the pool, then let the MCP app run its own lifespan (its session manager) inside.
         await self.pool.open()
+        if self.sender:
+            self.sender.start()
 
         async def wrapped_send(message: Any) -> None:
             if message["type"] == "lifespan.shutdown.complete":
+                if self.sender:
+                    await self.sender.stop()
                 await self.pool.close()
             await send(message)
 

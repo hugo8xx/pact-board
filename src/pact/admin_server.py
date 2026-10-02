@@ -3,6 +3,7 @@
 Same database and code as the board, a separate process. The kill switch, pausing and the audit
 log keep working when the MCP side is overloaded or down, and nothing an agent can reach shares
 a process with what only humans may do. It serves /healthz and /admin/api/* and nothing else.
+With ``PACT_SLACK_WEBHOOK_URL`` set it also delivers notifications to Slack.
 """
 
 import json
@@ -15,6 +16,7 @@ from starlette.types import Receive, Scope, Send
 
 from .admin_api import build_admin_app
 from .db import Conn, create_pool
+from .notify import SlackSender
 from .oauth import ResourceSettings, Verifier
 
 
@@ -22,6 +24,7 @@ class AdminServer:
     def __init__(self, pool: AsyncConnectionPool[Conn], settings: ResourceSettings) -> None:
         self.pool = pool
         self.admin_app = build_admin_app(pool, Verifier(settings))
+        self.sender = SlackSender.from_env(pool)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -42,8 +45,12 @@ class AdminServer:
             message: Any = await receive()
             if message["type"] == "lifespan.startup":
                 await self.pool.open()
+                if self.sender:
+                    self.sender.start()
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
+                if self.sender:
+                    await self.sender.stop()
                 await self.pool.close()
                 await send({"type": "lifespan.shutdown.complete"})
                 return

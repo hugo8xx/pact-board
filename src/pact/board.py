@@ -17,6 +17,7 @@ from .entries import EntryInput, append_entry
 from .errors import PactError
 from .handoff import require_handoff
 from .mandates import Chain, Limits, consume_limits, get_mandate, issue_child, revoke_subtree, verify_chain
+from .notify import enqueue as notify
 from .scope import action_covers, any_covers, board_scope
 
 Client = Literal["chat", "cowork", "design", "code", "gemini", "runner"]
@@ -247,6 +248,10 @@ class Board:
                 ),
             )
             ctx.task_id = task_id
+            if needs_approval:
+                await notify(
+                    conn, "approval_needed", project_id=project.id, task_id=task_id, agent_id=agent.id, title=title, detail=action
+                )
             notes = []
             if needs_approval:
                 notes.append(f'Action "{action}" needs a human approval in the Admin UI before anyone can claim it.')
@@ -386,6 +391,15 @@ class Board:
                        WHERE id = %s""",
                     (Jsonb(result) if result is not None else None, question or "input required", task_id),
                 )
+                await notify(
+                    conn,
+                    "question",
+                    project_id=project.id,
+                    task_id=task_id,
+                    agent_id=agent.id,
+                    title=task["title"],
+                    detail=question,
+                )
                 return {
                     "ok": True,
                     "task_id": task_id,
@@ -397,6 +411,16 @@ class Board:
                 "UPDATE tasks SET status = %s, result = %s WHERE id = %s",
                 (status, Jsonb(result) if result is not None else None, task_id),
             )
+            if task["parent_task_id"] is None:
+                await notify(
+                    conn,
+                    "task_closed",
+                    project_id=project.id,
+                    task_id=task_id,
+                    agent_id=agent.id,
+                    title=task["title"],
+                    detail=status,
+                )
             out: dict[str, Any] = {"ok": True, "task_id": task_id, "status": status}
             closed = await revoke_closed_task_mandates(conn, [task_id])
             if closed:
@@ -426,6 +450,9 @@ class Board:
                           assignee = NULL, assignee_mandate_id = NULL
                    WHERE id = %s""",
                 (reason, needed_scope, task_id),
+            )
+            await notify(
+                conn, "deferred", project_id=project.id, task_id=task_id, agent_id=agent.id, title=task["title"], detail=reason
             )
             return {
                 "ok": True,
