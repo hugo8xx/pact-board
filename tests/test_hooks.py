@@ -376,3 +376,47 @@ async def test_session_start_and_auto_claim_through_the_script(
     claimed = json.loads(run_hook(hook_dir, "user-prompt-submit", prompt, repo).stdout)
     assert "cover the login flow" in claimed["hookSpecificOutput"]["additionalContext"]
     assert await assignee(world, task_id) == "code-web"
+
+
+async def test_a_folder_of_repos_is_clean_only_when_every_repo_is(
+    world: World,
+    server_url: str,  # noqa: F811
+    hook_dir: Path,
+    tmp_path: Path,
+) -> None:
+    await setup(world)
+    task_id = await delegated(world)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    git_repo(workspace / "board")
+    git_repo(workspace / "admin")
+    (hook_dir / "code-web.env").write_text(
+        f"PACT_URL={server_url}\nPACT_TOKEN={world.tokens['code-web']}\nPACT_AUTO_CLAIM=1\nPACT_AUTO_CLAIM_FROM=chat-boss\n"
+    )
+    prompt = {"session_id": "w1", "hook_event_name": "UserPromptSubmit", "permission_mode": "default", "prompt": "hi"}
+
+    (workspace / "admin" / "wip.txt").write_text("x")
+    dirty = json.loads(run_hook(hook_dir, "user-prompt-submit", prompt, workspace).stdout)
+    assert "working tree" in dirty["systemMessage"] and await assignee(world, task_id) is None
+
+    (workspace / "admin" / "wip.txt").unlink()
+    claimed = json.loads(run_hook(hook_dir, "user-prompt-submit", prompt, workspace).stdout)
+    assert "hookSpecificOutput" in claimed and await assignee(world, task_id) == "code-web"
+
+
+async def test_a_folder_without_repos_is_never_clean(
+    world: World,
+    server_url: str,  # noqa: F811
+    hook_dir: Path,
+    tmp_path: Path,
+) -> None:
+    await setup(world)
+    task_id = await delegated(world)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (hook_dir / "code-web.env").write_text(
+        f"PACT_URL={server_url}\nPACT_TOKEN={world.tokens['code-web']}\nPACT_AUTO_CLAIM=1\nPACT_AUTO_CLAIM_FROM=chat-boss\n"
+    )
+    prompt = {"session_id": "e1", "hook_event_name": "UserPromptSubmit", "permission_mode": "default", "prompt": "hi"}
+    out = json.loads(run_hook(hook_dir, "user-prompt-submit", prompt, empty).stdout)
+    assert "working tree" in out["systemMessage"] and await assignee(world, task_id) is None
