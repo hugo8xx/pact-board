@@ -1,5 +1,15 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [{ "type": "command", "command": "/path/to/pact-board/hooks/pact-hook.sh code-web session-start", "timeout": 10 }]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [{ "type": "command", "command": "/path/to/pact-board/hooks/pact-hook.sh code-web user-prompt-submit", "timeout": 10 }]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Bash|Edit|MultiEdit|Write|NotebookEdit",

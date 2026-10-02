@@ -24,6 +24,7 @@ ErrorCode = Literal[
     "forbidden",
     "note_pinned",
     "handoff_required",
+    "agent_busy",
 ]
 
 

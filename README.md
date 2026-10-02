@@ -77,12 +77,23 @@ revoke, erase a payload, verify the log).
 
 ## Claude Code hooks
 
-Two optional hooks connect a Claude Code session to the board. Neither claims work.
+Optional hooks connect a Claude Code session to the board. Only `UserPromptSubmit` ever claims work.
 
 | Hook | What it does |
 | --- | --- |
+| `SessionStart` | when a session opens, shows the person the open tasks. Never claims. |
+| `UserPromptSubmit` | auto-claim: when the person types, claims the oldest task delegated to this agent, only if every condition below holds, and hands it to Claude framed as another agent's request (the person's messages take precedence). Otherwise it says why nothing was claimed. |
 | `PostToolUse` | logs each shell command and file edit as an Entry on the one task the agent is working on (secrets redacted, output not kept). These entries are heartbeats, so a long task is not released. With no task in hand, nothing is logged. |
 | `Stop` | after each reply, tells the person (not the model) when open tasks arrived since that session last looked. |
+
+Auto-claim takes a task only when all of these hold; missing any one, it claims nothing and tells the person why:
+
+1. the repo turned it on: `PACT_AUTO_CLAIM=1` in the agent's env file (off by default);
+2. the task's `delegate_to` is this agent, and its sender is listed in `PACT_AUTO_CLAIM_FROM` (comma-separated agent ids);
+3. the session's permission mode is `default`, so Claude still asks before acting;
+4. the working tree is clean (no uncommitted or staged changes);
+5. the agent holds no other task (the claim is `exclusive`, so two sessions of one agent cannot each take one);
+6. the project is not marked production, and not frozen.
 
 Set up, per repo:
 
@@ -93,7 +104,9 @@ Set up, per repo:
    and the agent id.
 
 The script needs only `sh` and `curl`. If the config is missing or the board is down it prints nothing and exits 0.
-The board serves the hooks at `POST /hooks/a/<agent-id>/{post-tool-use,stop}` and accepts agent tokens only.
+The board serves the hooks at `POST /hooks/a/<agent-id>/{session-start,user-prompt-submit,post-tool-use,stop}` and accepts
+agent tokens only. The script reports what the board cannot see in `X-Pact-Auto-Claim`, `X-Pact-Auto-Claim-From` and
+`X-Pact-Git-Clean` headers.
 
 ## Admin API
 

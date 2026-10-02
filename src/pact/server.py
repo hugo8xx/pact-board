@@ -141,9 +141,16 @@ def build_mcp(board: Board) -> MCPServer:
         )
 
     @mcp.tool(title="Claim a task")
-    async def pact_claim(ctx: Context, task_id: TaskId, mandate_id: MandateId) -> dict[str, Any]:
+    async def pact_claim(
+        ctx: Context,
+        task_id: TaskId,
+        mandate_id: MandateId,
+        exclusive: Annotated[
+            bool, Field(description="Refuse with agent_busy if you already hold a task: one task at a time.")
+        ] = False,
+    ) -> dict[str, Any]:
         """Take a task before starting it. Exactly one agent wins; on already_claimed, move on."""
-        return await _guard(board.claim(_agent(ctx), task_id=task_id, mandate_id=mandate_id))
+        return await _guard(board.claim(_agent(ctx), task_id=task_id, mandate_id=mandate_id, exclusive=exclusive))
 
     @mcp.tool(title="Report on a task")
     async def pact_report(
