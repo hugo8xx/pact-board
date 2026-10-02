@@ -96,6 +96,11 @@ Before revoking, `GET /admin/api/mandates/{id}/impact` shows what would go with 
 open tasks that get canceled, agents that lose authority) without changing anything. Resuming a
 deferred task takes an optional `answer`, which the agent then sees on the task in `pact_list`.
 
+Mandates are signed and never edited. To change an agent's permissions, `POST
+/admin/api/mandates/{id}/replace` with the new `scope` issues a fresh root mandate and makes it the
+agent's own. With `"revoke": true` the old root and everything delegated under it go too; without
+it, work already delegated under the old one carries on until it expires.
+
 ## Configuration
 
 | Variable | Required | Meaning |
