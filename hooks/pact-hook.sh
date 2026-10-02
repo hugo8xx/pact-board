@@ -20,9 +20,22 @@ conf="${PACT_HOOK_DIR:-$HOME/.config/pact}/$agent.env"
 . "$conf"
 [ -n "$PACT_URL" ] && [ -n "$PACT_TOKEN" ] || exit 0
 
+# Clean = no uncommitted or staged changes. A session opened in a folder that holds several repos
+# (not a repo itself) counts as clean only when it holds at least one repo and every one is clean.
 clean=0
-if [ "$event" = "user-prompt-submit" ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  [ -z "$(git status --porcelain 2>/dev/null)" ] && clean=1
+if [ "$event" = "user-prompt-submit" ]; then
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    [ -z "$(git status --porcelain 2>/dev/null)" ] && clean=1
+  else
+    found=0
+    clean=1
+    for d in */; do
+      [ -d "$d.git" ] || continue
+      found=1
+      [ -z "$(git -C "$d" status --porcelain 2>/dev/null)" ] || clean=0
+    done
+    [ "$found" = 1 ] || clean=0
+  fi
 fi
 
 out=$(curl -sS -m 5 -X POST \
