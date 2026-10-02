@@ -12,7 +12,7 @@ from pact.errors import PactError
 from pact.mandates import issue_root
 from pact.scope import board_scope
 
-from .conftest import World
+from .conftest import HANDOFF, World
 
 pytestmark = pytest.mark.anyio
 
@@ -66,7 +66,7 @@ async def test_design_agents_claim_and_report_design_work(world: World) -> None:
     )
     child = t["delegated_mandate_id"]
     await world.board.claim(design, task_id=t["task_id"], mandate_id=child)
-    out = await world.board.report(design, task_id=t["task_id"], status="completed", mandate_id=child, result="link")
+    out = await world.board.report(design, task_id=t["task_id"], status="completed", mandate_id=child, result=HANDOFF)
     assert out["status"] == "completed"
 
 
@@ -151,7 +151,7 @@ async def test_entries_trace_back_to_the_human_root(world: World) -> None:
     chat, code = world.agents["chat-boss"], world.agents["code-web"]
     t = await world.board.post(chat, project_id="web", title="trace", mandate_id=world.roots["chat-boss"], delegate_to="code-web")
     await world.board.claim(code, task_id=t["task_id"], mandate_id=t["delegated_mandate_id"])
-    await world.board.report(code, task_id=t["task_id"], status="completed", mandate_id=t["delegated_mandate_id"], result="done")
+    await world.board.report(code, task_id=t["task_id"], status="completed", mandate_id=t["delegated_mandate_id"], result=HANDOFF)
 
     async with transaction(world.pool) as conn:
         entries = await fetchall(conn, "SELECT mandate_chain FROM entries WHERE task_id = %s", (t["task_id"],))
@@ -339,14 +339,18 @@ async def test_stale_claim_is_released_and_old_holder_gets_claim_lost(world: Wor
     async with transaction(world.pool) as conn:
         await conn.execute("UPDATE task_activity SET at = now() - interval '31 minutes' WHERE task_id = %s", (t["task_id"],))
     await world.board.claim(b, task_id=t["task_id"], mandate_id=world.roots["code-web-2"])
-    await world.board.report(b, task_id=t["task_id"], status="completed", result="b's work", mandate_id=world.roots["code-web-2"])
+    await world.board.report(
+        b, task_id=t["task_id"], status="completed", result=HANDOFF + "\nb's work", mandate_id=world.roots["code-web-2"]
+    )
     await refused(
-        world.board.report(a, task_id=t["task_id"], status="completed", result="a's work", mandate_id=world.roots["code-web"]),
+        world.board.report(
+            a, task_id=t["task_id"], status="completed", result=HANDOFF + "\na's work", mandate_id=world.roots["code-web"]
+        ),
         "claim_lost",
     )
     async with transaction(world.pool) as conn:
         row = await fetchone(conn, "SELECT result FROM tasks WHERE id = %s", (t["task_id"],))
-    assert row == {"result": "b's work"}
+    assert row == {"result": HANDOFF + "\nb's work"}
 
 
 async def test_heartbeat_keeps_the_claim(world: World) -> None:
@@ -527,7 +531,7 @@ async def test_every_tool_under_five_seconds_with_1000_tasks_and_depth_5(world: 
     listed = await timed("list", world.board.list_tasks(deepest, mandate_id=mandate, limit=200))
     task_id = listed["tasks"][0]["id"]
     await timed("claim", world.board.claim(deepest, task_id=task_id, mandate_id=mandate))
-    await timed("report", world.board.report(deepest, task_id=task_id, status="completed", mandate_id=mandate))
+    await timed("report", world.board.report(deepest, task_id=task_id, status="completed", mandate_id=mandate, result=HANDOFF))
     await timed("post", world.board.post(deepest, project_id="web", title="deep", mandate_id=mandate))
     other = listed["tasks"][1]["id"]
     await timed("defer", world.board.defer(deepest, task_id=other, reason="r", mandate_id=mandate))
@@ -551,7 +555,7 @@ async def test_closing_a_task_revokes_its_delegated_mandate(world: World, status
     t = await delegate(world, "code-web")
     child = t["delegated_mandate_id"]
     await world.board.claim(code, task_id=t["task_id"], mandate_id=child)
-    out = await world.board.report(code, task_id=t["task_id"], status=status, mandate_id=child)  # type: ignore[arg-type]
+    out = await world.board.report(code, task_id=t["task_id"], status=status, mandate_id=child, result=HANDOFF)  # type: ignore[arg-type]
     assert out["revoked_mandate"] == child
 
     err = await refused(world.board.list_tasks(code, mandate_id=child), "mandate_revoked")
@@ -617,10 +621,13 @@ async def test_closing_a_task_reaches_grandchildren_and_cancels_open_subtasks(wo
     grandchild = sub["delegated_mandate_id"]
     await world.board.claim(b, task_id=sub["task_id"], mandate_id=grandchild)
 
-    out = await world.board.report(a, task_id=parent["task_id"], status="completed", mandate_id=child)
+    out = await world.board.report(a, task_id=parent["task_id"], status="completed", mandate_id=child, result=HANDOFF)
     assert out["subtasks_canceled"] == 1
     await refused(world.board.list_tasks(b, mandate_id=grandchild), "mandate_revoked")
-    await refused(world.board.report(b, task_id=sub["task_id"], status="completed", mandate_id=grandchild), "mandate_revoked")
+    await refused(
+        world.board.report(b, task_id=sub["task_id"], status="completed", mandate_id=grandchild, result=HANDOFF),
+        "mandate_revoked",
+    )
     async with transaction(world.pool) as conn:
         row = await fetchone(conn, "SELECT status, result FROM tasks WHERE id = %s", (sub["task_id"],))
     assert row == {"status": "canceled", "result": {"reason": "mandate_revoked", "mandate_id": child}}
@@ -661,3 +668,55 @@ async def test_input_required_waits_for_a_human_and_resumes(world: World) -> Non
 
     await world.admin.resume_task(t["task_id"], by="boss")
     await world.board.claim(code, task_id=t["task_id"], mandate_id=child)  # same task, same mandate
+
+
+# ── handoff ───────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "canceled"])
+@pytest.mark.parametrize("result", [None, "done", "# Notes\nhandoff later", {"summary": "x"}, {"handoff": ""}])
+async def test_closing_without_a_handoff_is_refused_and_the_task_stays_open(world: World, status: str, result: Any) -> None:
+    await setup_web(world)
+    code = world.agents["code-web"]
+    t = await delegate(world, "code-web")
+    child = t["delegated_mandate_id"]
+    await world.board.claim(code, task_id=t["task_id"], mandate_id=child)
+    err = await refused(
+        world.board.report(code, task_id=t["task_id"], status=status, mandate_id=child, result=result),  # type: ignore[arg-type]
+        "handoff_required",
+    )
+    assert "## Handoff" in err.message  # the refusal carries the template
+    async with transaction(world.pool) as conn:
+        row = await fetchone(conn, "SELECT status, assignee FROM tasks WHERE id = %s", (t["task_id"],))
+    assert row == {"status": "working", "assignee": "code-web"}
+    await world.board.list_tasks(code, mandate_id=child)  # mandate still live
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        "Built it.\n\n## Handoff\n- Repo / branch / PR / commit: org/repo · feat/x · PR #3",
+        "### handoff\n- no code",
+        {"handoff": {"branch": "feat/x", "pr": 3}},
+        {"Handoff": "- branch feat/x"},
+    ],
+)
+async def test_a_handoff_closes_the_task(world: World, result: Any) -> None:
+    await setup_web(world)
+    code = world.agents["code-web"]
+    t = await delegate(world, "code-web")
+    child = t["delegated_mandate_id"]
+    await world.board.claim(code, task_id=t["task_id"], mandate_id=child)
+    out = await world.board.report(code, task_id=t["task_id"], status="completed", mandate_id=child, result=result)
+    assert out["status"] == "completed"
+
+
+async def test_heartbeats_and_questions_need_no_handoff(world: World) -> None:
+    await setup_web(world)
+    code = world.agents["code-web"]
+    t = await delegate(world, "code-web")
+    child = t["delegated_mandate_id"]
+    await world.board.claim(code, task_id=t["task_id"], mandate_id=child)
+    await world.board.report(code, task_id=t["task_id"], status="working", mandate_id=child)
+    out = await world.board.report(code, task_id=t["task_id"], status="input_required", mandate_id=child, result="which db?")
+    assert out["status"] == "input_required"

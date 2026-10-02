@@ -35,6 +35,8 @@ of authority that traces back to a human. Rules:
 - Claim (pact_claim) before you start any task. If you get already_claimed, move on quietly.
 - While working, call pact_report with status "working" at least every 20 minutes, or the
   board releases your claim after 30 minutes and someone else may take the task.
+- Closing a task (completed, failed, canceled) needs a handoff in result: a markdown section headed
+  "Handoff" with what was done, repo/branch/PR/commit, checks, what is left and what needs a human.
 - If a task needs more authority than your mandate gives, call pact_defer and stop. Never try
   to work around a refusal and never ask for a mandate for yourself.
 - When you post a task for another agent, tell the user it starts only when that agent next
@@ -151,12 +153,22 @@ def build_mcp(board: Board) -> MCPServer:
             Field(
                 description=(
                     "working = heartbeat (send at least every 20 minutes); "
-                    "input_required = ask a human (the question goes in result); others close the task."
+                    "input_required = ask a human (the question goes in result); others close the task "
+                    "and need a handoff in result."
                 )
             ),
         ],
         mandate_id: MandateId,
-        result: Annotated[Any, Field(description="What you produced, or why it failed.")] = None,
+        result: Annotated[
+            Any,
+            Field(
+                description=(
+                    "What you produced, or why it failed. Closing needs a markdown section headed 'Handoff' "
+                    "(done; repo/branch/PR/commit; checks; left/next; needs a human; links) "
+                    "or an object with a 'handoff' key."
+                )
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         """Send progress or the final result. claim_lost means the board released your claim — stop
         and do not overwrite the new holder's work."""

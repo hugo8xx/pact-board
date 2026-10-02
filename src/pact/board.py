@@ -15,6 +15,7 @@ from .crypto import iso
 from .db import Conn, fetchall, fetchone, transaction
 from .entries import EntryInput, append_entry
 from .errors import PactError
+from .handoff import require_handoff
 from .mandates import Chain, Limits, consume_limits, get_mandate, issue_child, revoke_subtree, verify_chain
 from .scope import action_covers, any_covers, board_scope
 
@@ -391,6 +392,7 @@ class Board:
                     "status": "input_required",
                     "note": "A human sees this in the deferred list, answers, and resumes it. Stop working on it.",
                 }
+            require_handoff(status, result)
             await conn.execute(
                 "UPDATE tasks SET status = %s, result = %s WHERE id = %s",
                 (status, Jsonb(result) if result is not None else None, task_id),

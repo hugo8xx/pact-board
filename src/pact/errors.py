@@ -23,6 +23,7 @@ ErrorCode = Literal[
     "invalid_request",
     "forbidden",
     "note_pinned",
+    "handoff_required",
 ]
 
 

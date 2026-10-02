@@ -8,7 +8,7 @@ import pytest
 from pact.errors import PactError
 from pact.oauth import ResourceSettings
 
-from .conftest import World
+from .conftest import HANDOFF, World
 from .oauth_fixtures import HEADERS, Issuer
 
 pytestmark = pytest.mark.anyio
@@ -248,7 +248,7 @@ async def test_people_release_and_cancel_tasks(world: World, board: tuple[str, R
     await world.board.claim(code, task_id=t, mandate_id=child)
     assert (await api(url, "POST", f"/tasks/{t}/release", boss)).json()["released_from"] == "code-web"
     with pytest.raises(PactError) as e:
-        await world.board.report(code, task_id=t, status="completed", mandate_id=child, result="done")
+        await world.board.report(code, task_id=t, status="completed", mandate_id=child, result=HANDOFF)
     assert e.value.code == "claim_lost"
 
     # Deferred tasks can be canceled too; the delegated mandate dies with the task.
