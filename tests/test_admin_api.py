@@ -5,6 +5,7 @@ from typing import Any
 import httpx2
 import pytest
 
+from pact.errors import PactError
 from pact.oauth import ResourceSettings
 
 from .conftest import World
@@ -332,3 +333,40 @@ async def test_people_answer_deferred_tasks_when_resuming(
     assert r.status_code == 200
     seen = (await world.board.list_tasks(code, mandate_id=child, filter="open"))["tasks"]
     assert [(x["id"], x["answer"]) for x in seen] == [(t, "Thai first")]
+
+
+async def test_people_change_an_agents_permissions_by_replacing_its_root(
+    world: World, board: tuple[str, ResourceSettings], issuer: Issuer
+) -> None:
+    url, settings = board
+    await people(world)
+    boss = admin_token(issuer, settings)
+    old = world.roots["chat-boss"]
+    agent = world.agents["chat-boss"]
+    with pytest.raises(PactError, match="context.write"):
+        await world.board.note(agent, mandate_id=old, project_id="web", key="k", title="t", body="b")
+    posted = await world.board.post(agent, project_id="web", title="fix", delegate_to="code-web", mandate_id=old)
+
+    wider = ["task.read@project:web", "task.post@project:web", "task.work@project:web", "context.write@project:web"]
+    out = (await api(url, "POST", f"/mandates/{old}/replace", boss, {"scope": wider})).json()
+    assert out["replaced"] == old and out["revoked"] is False
+    new = out["mandate_id"]
+    await world.board.note(agent, mandate_id=new, project_id="web", key="k", title="t", body="b")
+    assert await world.board.default_mandate(agent) == new
+    # Without revoke, the old mandate and the work delegated under it carry on.
+    mandates = {m["id"]: m for m in (await api(url, "GET", "/mandates", boss)).json()}
+    assert old in mandates and posted["delegated_mandate_id"] in mandates
+
+    # Replacing again with revoke narrows for real: the previous root and its subtree go.
+    again = (await api(url, "POST", f"/mandates/{old}/replace", boss, {"scope": wider[:1], "revoke": True})).json()
+    assert again["revoked"] is True and again["descendant_mandates"] == 1 and again["tasks_stopped"] == 1
+    assert old not in {m["id"] for m in (await api(url, "GET", "/mandates", boss)).json()}
+    trace = (await api(url, "GET", f"/tasks/{posted['task_id']}", boss)).json()
+    assert trace["task"]["status"] in ("canceled", "failed")
+
+    r = await api(url, "POST", f"/mandates/{old}/replace", boss, {"scope": wider})
+    assert r.status_code == 400 and "not a live root" in r.json()["message"]
+    r = await api(url, "POST", f"/mandates/{new}/replace", boss, {"scope": ["context.write@project:other"]})
+    assert r.json()["error"] == "project_mismatch"
+    vic = admin_token(issuer, settings, who="vic")
+    assert (await api(url, "POST", f"/mandates/{new}/replace", vic, {"scope": wider})).status_code == 403

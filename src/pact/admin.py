@@ -227,6 +227,59 @@ class Admin:
             )
             return m.id
 
+    async def replace_mandate(
+        self,
+        mandate_id: str,
+        *,
+        by: str,
+        scope: list[str],
+        limits: Limits | None = None,
+        delegations: int | None = None,
+        days: float = DEFAULT_MANDATE_DAYS,
+        revoke: bool = False,
+    ) -> dict[str, Any]:
+        """Change an agent's permissions. Mandates are signed and never edited, so this issues a new
+        root mandate, makes it the agent's own, and (with ``revoke``) revokes the old one with
+        everything delegated under it. Without ``revoke`` the old one lives on until it expires,
+        so work already delegated under it keeps going."""
+        bad = [s for s in scope if not is_valid_scope(s)]
+        if not scope or bad:
+            raise PactError("invalid_request", f"invalid scope: {', '.join(bad)}" if bad else "scope is empty")
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            old = await get_mandate(conn, mandate_id)
+            if old is None:
+                raise PactError("not_found", f"mandate {mandate_id} does not exist")
+            if old.parent_id is not None or old.revoked_at is not None:
+                raise PactError("invalid_request", f"mandate {mandate_id} is not a live root mandate")
+            projects = {p.id for p in await agent_projects(conn, old.holder)}
+            foreign = [s for s in scope if "@project:" in s and s.split("@project:", 1)[1] not in projects]
+            if foreign:
+                raise PactError("project_mismatch", f"{old.holder} is not registered in: {', '.join(foreign)}")
+            new = await issue_root(
+                conn,
+                human=by,
+                holder=old.holder,
+                scope=scope,
+                limits=old.limits if limits is None else limits,
+                delegations=old.delegations_left if delegations is None else delegations,
+                expires_at=datetime.now(UTC) + timedelta(days=days),
+            )
+            await conn.execute("UPDATE agents SET root_mandate_id = %s WHERE id = %s", (new.id, old.holder))
+            revoked = {"descendant_mandates": 0, "tasks_stopped": 0}
+            if revoke:
+                r = await revoke_subtree(conn, mandate_id)
+                await revoke_closed_task_mandates(conn, [tid for tid, _ in r["stopped"]])
+                revoked = {"descendant_mandates": r["descendant_mandates"], "tasks_stopped": r["tasks_stopped"]}
+            await self._log(
+                conn,
+                by,
+                "admin.mandate.replace",
+                {"holder": old.holder, "replaces": mandate_id, "scope": scope, "was": old.scope, "revoked": revoke},
+                mandate_chain=[new.id],
+            )
+            return {"mandate_id": new.id, "replaced": mandate_id, "revoked": revoke, **revoked}
+
     async def revoke_mandate(self, mandate_id: str, *, by: str) -> dict[str, Any]:
         async with transaction(self.pool) as conn:
             await self._require(conn, by, "approver")

@@ -369,6 +369,18 @@ class AdminApi:
             )
         }
 
+    async def replace_mandate(self, request: Request, human: str) -> Any:
+        b = await _body(request)
+        return await self.admin.replace_mandate(
+            request.path_params["mandate_id"],
+            by=human,
+            scope=list(b.get("scope") or []),
+            limits=b.get("limits"),
+            delegations=None if b.get("delegations") is None else int(b["delegations"]),
+            days=float(b.get("days", 30)),
+            revoke=bool(b.get("revoke")),
+        )
+
     async def revoke_mandate(self, request: Request, human: str) -> Any:
         return await self.admin.revoke_mandate(request.path_params["mandate_id"], by=human)
 
@@ -428,6 +440,7 @@ def build_admin_app(pool: AsyncConnectionPool[Conn], verifier: Verifier) -> Star
             Route(f"{p}/mandates", r(a.issue_mandate), methods=["POST"]),
             Route(f"{p}/mandates/{{mandate_id}}/impact", r(a.mandate_impact)),
             Route(f"{p}/mandates/{{mandate_id}}/revoke", r(a.revoke_mandate), methods=["POST"]),
+            Route(f"{p}/mandates/{{mandate_id}}/replace", r(a.replace_mandate), methods=["POST"]),
             Route(f"{p}/tasks", r(a.tasks)),
             Route(f"{p}/tasks/{{task_id}}", r(a.task_trace)),
             Route(f"{p}/tasks/{{task_id}}/{{decision}}", r(a.decide_task), methods=["POST"]),
