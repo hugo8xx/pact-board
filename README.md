@@ -33,6 +33,11 @@ UI is read-only for agents. Notes are redacted, versioned, erasable (PDPA), and 
 with their author, never as instructions. They are also MCP resources:
 `pact://projects/<p>/context` and `pact://projects/<p>/context/<key>`. `pact_whoami` lists their titles.
 
+**Handoff.** `pact_report` with `completed`, `failed` or `canceled` must carry a handoff in `result`:
+a markdown section headed `Handoff` (what was done; repo / branch / PR / commit; checks; what is left;
+what needs a human; links), or an object with a `handoff` key. Without it the board refuses with
+`handoff_required` and the task stays open. Heartbeats (`working`) and `input_required` need none.
+
 A mandate delegated with `pact_post` lives only as long as its task: once the task is completed,
 failed, canceled or rejected, that mandate and everything under it is revoked, and open subtasks
 posted under it are canceled. `pact-admin migrate` sweeps any left over from before this rule.
