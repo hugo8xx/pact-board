@@ -38,6 +38,12 @@ a markdown section headed `Handoff` (what was done; repo / branch / PR / commit;
 what needs a human; links), or an object with a `handoff` key. Without it the board refuses with
 `handoff_required` and the task stays open. Heartbeats (`working`) and `input_required` need none.
 
+**Notifications.** The board tells people when it needs them: a task waiting for approval, a task
+deferred or asking a question (`input_required`), and a top-level task closing. Each is written to a
+`notifications` outbox in the same transaction as the event; a sender posts pending rows to Slack
+(`PACT_SLACK_WEBHOOK_URL`), retrying with backoff, so a Slack outage never fails board work. Messages
+carry a redacted, shortened title and first line of detail plus a link to the task, never its body.
+
 A mandate delegated with `pact_post` lives only as long as its task: once the task is completed,
 failed, canceled or rejected, that mandate and everything under it is revoked, and open subtasks
 posted under it are canceled. `pact-admin migrate` sweeps any left over from before this rule.
@@ -118,6 +124,8 @@ it, work already delegated under the old one carries on until it expires.
 | `PACT_ROLE` | no | `admin` runs the Admin API service (`pact-admin-api`) instead of the board |
 | `PACT_ADMIN_AUDIENCE` | Admin API service | audience of Admin API tokens; set it to `<board URL>/admin` so tokens stay the same |
 | `PACT_ADMIN_API` | no | default `on`; `off` makes the board stop serving `/admin/api` once the Admin API service is live |
+| `PACT_SLACK_WEBHOOK_URL` | no | a Slack incoming webhook; the process that has it delivers notifications (set it on the Admin API service only) |
+| `PACT_ADMIN_UI_URL` | no | the Admin UI's URL, so a notification links to its task, e.g. `https://admin.example.com` |
 | `PORT`, `HOST` | no | default `8787`, `127.0.0.1` (`0.0.0.0` in the container) |
 
 ## Deploy on Railway
