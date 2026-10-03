@@ -10,6 +10,7 @@ dependencies = [
     "mcp>=2.2",
     "psycopg[binary,pool]>=3.3",
     "pyjwt[crypto]>=2.15",
+    "tenuo>=0.3.1,<0.4",
     "uvicorn>=0.54",
 ]
 

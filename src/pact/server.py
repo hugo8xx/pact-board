@@ -18,6 +18,7 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from . import credentials
 from .admin_api import build_admin_app
 from .auth import agent_for_token
 from .board import Agent, Board, ListFilter, ReportStatus
@@ -267,6 +268,8 @@ def admin_api_on_board() -> bool:
 
 _HOOK_PATH = re.compile(r"^/hooks/a/([a-z0-9][a-z0-9-]{0,62})/([a-z-]+)$")
 KEYS_PATH = "/.well-known/pact-keys.json"
+SRL_PATH = "/.well-known/pact-revocations/tenuo"
+SRL_VERSION_HEADER = b"x-pact-revocations-version"
 _METADATA_PATH = re.compile(r"^/\.well-known/oauth-protected-resource/mcp/a/([a-z0-9][a-z0-9-]{0,62})/?$")
 
 
@@ -301,6 +304,9 @@ class PactApp:
         if path == KEYS_PATH:
             # Public keys only: anyone may verify what the board signed.
             await _respond(send, 200, keyring().jwks(), extra_headers=[(b"access-control-allow-origin", b"*")])
+            return
+        if path == SRL_PATH:
+            await self._revocations(send, "tenuo")
             return
         if path.startswith("/admin/api/"):
             if not admin_api_on_board():
@@ -356,6 +362,23 @@ class PactApp:
         state = dict(scope.get("state") or {})
         state["pact_agent"] = agent
         await self.mcp_app({**scope, "path": "/mcp", "raw_path": b"/mcp", "state": state}, receive, send)
+
+    async def _revocations(self, send: Send, fmt_name: str) -> None:
+        """The signed list of outside credential ids revoked on the board. Public, like the keys:
+        it names only warrant ids. Built fresh on each request so a revoke shows up at once."""
+        async with transaction(self.pool) as conn:
+            revoked, version = await credentials.revocation_state(conn, fmt_name)
+        body = credentials.get(fmt_name).revocation_list(revoked, keyring=keyring(), version=version)
+        headers = [
+            (b"content-type", b"application/octet-stream"),
+            (b"content-length", str(len(body)).encode()),
+            (b"cache-control", b"no-store"),
+            (b"access-control-allow-origin", b"*"),
+            (b"access-control-expose-headers", SRL_VERSION_HEADER),
+            (SRL_VERSION_HEADER, str(version).encode()),
+        ]
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": body})
 
     async def _hook(self, scope: Scope, receive: Receive, send: Send, agent_id: str, event: str) -> None:
         """Claude Code hooks authenticate with the agent's token only; OAuth is for the Claude apps."""

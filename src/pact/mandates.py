@@ -374,6 +374,7 @@ async def revoke_subtree(conn: Conn, mandate_id: str) -> dict[str, Any]:
     and every open task hanging under it stops."""
     await conn.execute("UPDATE mandates SET revoked_at = now() WHERE id = %s AND revoked_at IS NULL", (mandate_id,))
     subtree = [m["id"] for m in await _subtree(conn, mandate_id)]
+    await _revoke_exported(conn, subtree)
     stopped = await fetchall(
         conn,
         f"""UPDATE tasks SET status = 'canceled', assignee = NULL, assignee_mandate_id = NULL,
@@ -387,6 +388,26 @@ async def revoke_subtree(conn: Conn, mandate_id: str) -> dict[str, Any]:
         "tasks_stopped": len(stopped),
         "stopped": [(str(r["id"]), r["project_id"]) for r in stopped],
     }
+
+
+async def _revoke_exported(conn: Conn, mandate_ids: list[str]) -> None:
+    """Put every outside id minted for these links on the published revocation list, in the
+    revoke's own transaction, and bump the list's version for each format that gained ids."""
+    added = await fetchall(
+        conn,
+        """INSERT INTO credential_revocations (external_id, format, expires_at)
+           SELECT l.external_id, l.format, m.expires_at FROM credential_links l JOIN mandates m ON m.id = l.mandate_id
+           WHERE l.mandate_id = ANY(%s::uuid[])
+           ON CONFLICT (external_id) DO NOTHING
+           RETURNING format""",
+        (mandate_ids,),
+    )
+    for fmt in sorted({r["format"] for r in added}):
+        await conn.execute(
+            """INSERT INTO credential_revocation_version (format, version) VALUES (%s, 1)
+               ON CONFLICT (format) DO UPDATE SET version = credential_revocation_version.version + 1""",
+            (fmt,),
+        )
 
 
 def _is_uuid(value: str) -> bool:

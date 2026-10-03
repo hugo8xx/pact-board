@@ -32,6 +32,9 @@ class Exported:
     format: str
     external_id: str
     credential: bytes
+    links: tuple[tuple[str, str], ...] = ()
+    """(mandate id, external id) for every piece of the credential, so revoking any ledger link
+    finds what was minted for it. Empty when the credential has one id (``external_id``)."""
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,18 @@ class CredentialFormat(Protocol):
 
 
 _FORMATS: dict[str, CredentialFormat] = {}
+_BUILTIN = ("tenuo",)
+"""Formats shipped with the board, loaded the first time they are asked for."""
+
+
+def _builtin(name: str) -> CredentialFormat | None:
+    if name == "tenuo":
+        from .tenuo import TenuoFormat
+
+        fmt = TenuoFormat()
+        register(fmt)
+        return fmt
+    return None
 
 
 def register(fmt: CredentialFormat) -> None:
@@ -85,15 +100,15 @@ def register(fmt: CredentialFormat) -> None:
 
 
 def get(name: str) -> CredentialFormat:
-    fmt = _FORMATS.get(name)
+    fmt = _FORMATS.get(name) or _builtin(name)
     if fmt is None:
-        known = ", ".join(sorted(_FORMATS)) or "none"
+        known = ", ".join(names()) or "none"
         raise PactError("invalid_request", f"credential format {name!r} is not available (available: {known})")
     return fmt
 
 
 def names() -> list[str]:
-    return sorted(_FORMATS)
+    return sorted({*_FORMATS, *_BUILTIN})
 
 
 async def holder_keys(conn: Conn, agent_ids: Sequence[str]) -> dict[str, bytes]:
@@ -107,8 +122,29 @@ async def holder_keys(conn: Conn, agent_ids: Sequence[str]) -> dict[str, bytes]:
 
 
 async def store_export(conn: Conn, mandate_id: str, exported: Exported) -> None:
-    """Record on the mandate that it now also exists as an outside credential."""
+    """Record on the mandate that it now also exists as an outside credential, and which outside
+    ids were minted for each link of its chain (``credential_links``), for revocation."""
     await conn.execute(
         "UPDATE mandates SET exported_as = %s, external_id = %s, credential = %s WHERE id = %s AND format = 'pact'",
         (exported.format, exported.external_id, exported.credential, mandate_id),
     )
+    links = exported.links or ((mandate_id, exported.external_id),)
+    async with conn.cursor() as cur:
+        await cur.executemany(
+            "INSERT INTO credential_links (mandate_id, format, external_id) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+            [(m, exported.format, x) for m, x in links],
+        )
+
+
+async def revocation_state(conn: Conn, format: str) -> tuple[list[str], int]:
+    """The outside ids of ``format`` revoked on the board and not yet expired, and the list's version."""
+    from ..db import fetchall, fetchone
+
+    rows = await fetchall(
+        conn,
+        """SELECT r.external_id FROM credential_revocations r
+           WHERE r.format = %s AND (r.expires_at IS NULL OR r.expires_at > now()) ORDER BY r.revoked_at, r.external_id""",
+        (format,),
+    )
+    version = await fetchone(conn, "SELECT version FROM credential_revocation_version WHERE format = %s", (format,))
+    return [r["external_id"] for r in rows], int(version["version"]) if version else 0

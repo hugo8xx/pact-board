@@ -1,6 +1,7 @@
 """The eight board tools, as plain async methods. The MCP layer only maps arguments onto them."""
 
 import json
+import logging
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -11,11 +12,13 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from . import context as notes
+from . import credentials
 from .crypto import iso
 from .db import Conn, fetchall, fetchone, transaction
 from .entries import EntryInput, append_entry
 from .errors import PactError
 from .handoff import require_handoff
+from .keys import keyring
 from .mandates import Chain, Limits, consume_limits, get_mandate, issue_child, revoke_subtree, verify_chain
 from .notify import enqueue as notify
 from .scope import action_covers, any_covers, board_scope
@@ -25,6 +28,8 @@ ListFilter = Literal["mine", "open", "all"]
 ReportStatus = Literal["working", "completed", "failed", "canceled", "input_required"]
 
 POST_ONLY_CLIENTS: tuple[Client, ...] = ("chat", "cowork")
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -56,6 +61,37 @@ TERMINAL_STATUSES = ("completed", "failed", "canceled", "rejected")
 """A task in one of these is done for good; the mandate delegated for it dies with it."""
 
 T = TypeVar("T")
+
+
+def export_format() -> str | None:
+    """``PACT_EXPORT_FORMAT``: the credential format handed to agents on claim, or none."""
+    return os.environ.get("PACT_EXPORT_FORMAT", "").strip() or None
+
+
+async def _export_on_claim(conn: Conn, chain: Chain, fmt_name: str) -> dict[str, Any]:
+    """Mint the claimed chain as an outside credential and record it. The claim itself never
+    fails because of this: a refusal comes back as ``credential_note``, and the export's writes
+    sit in a savepoint so a failure leaves the claim's own writes intact."""
+    try:
+        fmt = credentials.get(fmt_name)
+        async with conn.transaction():
+            keys = await credentials.holder_keys(conn, [chain.leaf.holder])
+            if chain.leaf.holder not in keys:
+                return {"credential_note": f"no {fmt_name} credential: agent {chain.leaf.holder} has no registered public key"}
+            exported = fmt.mint(chain, keyring=keyring(), holder_keys=keys)
+            await credentials.store_export(conn, chain.leaf.id, exported)
+    except PactError as err:
+        return {"credential_note": f"no {fmt_name} credential: {err.message}"}
+    except Exception as err:  # an adapter bug must not cost the agent its claim
+        log.exception("exporting mandate %s as %s failed", chain.leaf.id, fmt_name)
+        return {"credential_note": f"no {fmt_name} credential: export failed ({type(err).__name__})"}
+    return {
+        "credential": {
+            "format": exported.format,
+            "external_id": exported.external_id,
+            "warrant_stack": exported.credential.decode(),
+        }
+    }
 
 
 def stale_minutes() -> float:
@@ -389,7 +425,11 @@ class Board:
                     raise PactError("already_claimed", f"task {task_id} is already claimed by {now['assignee']}")
                 state = f"{now['status']}{' (deferred)' if now['deferred'] else ''}" if now else "gone"
                 raise PactError("invalid_request", f"task {task_id} is {state} and cannot be claimed")
-            return {"ok": True, "task_id": task_id, "status": "working"}
+            out: dict[str, Any] = {"ok": True, "task_id": task_id, "status": "working"}
+            fmt = export_format()
+            if fmt:
+                out.update(await _export_on_claim(conn, chain, fmt))
+            return out
 
         payload = {"task_id": task_id, "mandate_id": mandate_id, "exclusive": exclusive}
         return await self._call(agent, "pact_claim", payload, run)
