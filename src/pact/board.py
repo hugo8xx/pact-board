@@ -24,7 +24,7 @@ from .notify import enqueue as notify
 from .scope import action_covers, any_covers, board_scope
 
 Client = Literal["chat", "cowork", "design", "code", "gemini", "runner"]
-ListFilter = Literal["mine", "open", "all"]
+ListFilter = Literal["mine", "open", "done", "all"]
 ReportStatus = Literal["working", "completed", "failed", "canceled", "input_required"]
 
 POST_ONLY_CLIENTS: tuple[Client, ...] = ("chat", "cowork")
@@ -360,10 +360,12 @@ class Board:
             cursor = since or 0
             where = {
                 "open": "status = 'submitted' AND assignee IS NULL AND (delegate_to IS NULL OR delegate_to = %(me)s)",
-                "mine": "(assignee = %(me)s OR delegate_to = %(me)s OR created_by = %(me)s)",
+                # Yours and still open; closed ones are under "done", so a long history never floods the answer.
+                "mine": "(assignee = %(me)s OR delegate_to = %(me)s OR created_by = %(me)s) AND NOT status = ANY(%(closed)s)",
+                "done": "(assignee = %(me)s OR delegate_to = %(me)s OR created_by = %(me)s) AND status = ANY(%(closed)s)",
                 "all": "true",
             }[filter]
-            params = {"projects": readable, "me": agent.id, "since": cursor, "limit": n}
+            params = {"projects": readable, "me": agent.id, "since": cursor, "limit": n, "closed": list(TERMINAL_STATUSES)}
             rows = await fetchall(
                 conn,
                 f"""SELECT * FROM tasks WHERE project_id = ANY(%(projects)s) AND change_seq > %(since)s AND {where}
@@ -756,6 +758,8 @@ def _summary(t: dict[str, Any]) -> dict[str, Any]:
     if t["deferred"]:
         out["defer_reason"] = t["defer_reason"]
         out["needed_scope"] = t["needed_scope"]
+        if t["result"] == t["defer_reason"]:
+            out["result"] = None  # an input_required question is already the defer_reason; send it once
     return out
 
 

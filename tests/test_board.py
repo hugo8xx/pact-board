@@ -720,3 +720,36 @@ async def test_heartbeats_and_questions_need_no_handoff(world: World) -> None:
     await world.board.report(code, task_id=t["task_id"], status="working", mandate_id=child)
     out = await world.board.report(code, task_id=t["task_id"], status="input_required", mandate_id=child, result="which db?")
     assert out["status"] == "input_required"
+
+
+# ── list sizes ────────────────────────────────────────────────────────────────
+
+
+async def test_mine_lists_open_work_and_done_lists_the_closed(world: World) -> None:
+    """An agent's history must not flood every pact_list(mine): closed tasks move to "done"."""
+    await setup_web(world)
+    code = world.agents["code-web"]
+    finished = await delegate(world, "code-web", title="finished")
+    await world.board.claim(code, task_id=finished["task_id"], mandate_id=finished["delegated_mandate_id"])
+    await world.board.report(
+        code, task_id=finished["task_id"], status="completed", mandate_id=finished["delegated_mandate_id"], result=HANDOFF
+    )
+    waiting = await delegate(world, "code-web", title="waiting")
+
+    mine = await world.board.list_tasks(code, mandate_id=world.roots["code-web"], filter="mine")
+    assert [t["id"] for t in mine["tasks"]] == [waiting["task_id"]]
+    done = await world.board.list_tasks(code, mandate_id=world.roots["code-web"], filter="done")
+    assert [t["id"] for t in done["tasks"]] == [finished["task_id"]]
+    assert done["tasks"][0]["result"] == HANDOFF  # a closed task's report is still readable in full
+
+
+async def test_a_deferred_question_is_sent_once(world: World) -> None:
+    await setup_web(world)
+    code = world.agents["code-web"]
+    t = await delegate(world, "code-web")
+    await world.board.claim(code, task_id=t["task_id"], mandate_id=t["delegated_mandate_id"])
+    await world.board.report(
+        code, task_id=t["task_id"], status="input_required", mandate_id=t["delegated_mandate_id"], result="Which region?"
+    )
+    [d] = (await world.board.list_tasks(world.agents["chat-boss"], mandate_id=world.roots["chat-boss"]))["deferred"]
+    assert d["defer_reason"] == "Which region?" and d["result"] is None
