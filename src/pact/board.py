@@ -379,7 +379,8 @@ class Board:
                 params,
             )
             return {
-                "tasks": [_summary(t) for t in rows],
+                # Deferred tasks come back in their own list only, never twice.
+                "tasks": [_summary(t) for t in rows if not t["deferred"]],
                 "deferred": [_summary(t) for t in deferred],
                 "next_since": max([cursor, *(t["change_seq"] for t in rows)]),
                 "has_more": len(rows) == n,

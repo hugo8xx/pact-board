@@ -753,3 +753,13 @@ async def test_a_deferred_question_is_sent_once(world: World) -> None:
     )
     [d] = (await world.board.list_tasks(world.agents["chat-boss"], mandate_id=world.roots["chat-boss"]))["deferred"]
     assert d["defer_reason"] == "Which region?" and d["result"] is None
+
+
+async def test_a_deferred_task_is_listed_once(world: World) -> None:
+    await setup_web(world)
+    code = world.agents["code-web"]
+    t = await delegate(world, "code-web")
+    await world.board.claim(code, task_id=t["task_id"], mandate_id=t["delegated_mandate_id"])
+    await world.board.defer(code, task_id=t["task_id"], reason="needs a person", mandate_id=t["delegated_mandate_id"])
+    mine = await world.board.list_tasks(world.agents["chat-boss"], mandate_id=world.roots["chat-boss"], filter="mine")
+    assert mine["tasks"] == [] and [x["id"] for x in mine["deferred"]] == [t["task_id"]]
