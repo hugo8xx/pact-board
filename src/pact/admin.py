@@ -11,6 +11,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from . import context as notes
+from . import credentials
 from .board import (
     POST_ONLY_CLIENTS,
     TERMINAL_STATUSES,
@@ -23,8 +24,8 @@ from .crypto import new_token, sha256
 from .db import Conn, fetchall, fetchone, transaction
 from .entries import SYSTEM_CHAIN, EntryInput, append_entry, erase_payload, verify_entry_chain
 from .errors import PactError
-from .keys import b64url, public_key_from_text
-from .mandates import Limits, get_mandate, issue_root, revoke_impact, revoke_subtree
+from .keys import b64url, b64url_decode, public_key_from_text
+from .mandates import MAX_DEPTH, ImportedLink, Limits, get_mandate, issue_root, revoke_impact, revoke_subtree
 from .scope import board_scope, is_valid_scope
 
 Role = Literal["owner", "approver", "viewer"]
@@ -237,6 +238,122 @@ class Admin:
             )
             await self._log(conn, by, "admin.agent_key.revoke", {"agent": agent_id, "kid": kid})
             return cur.rowcount
+
+    async def add_trusted_root(self, public_key: str, *, human: str, by: str, label: str | None = None) -> dict[str, Any]:
+        """Trust an outside Ed25519 key (base64url of its raw 32 bytes) to issue credentials on
+        behalf of ``human``. Owners only: a trusted root can grant agents authority in that
+        person's name, so adding one is as weighty as adding the person."""
+        try:
+            raw = public_key_from_text(public_key)
+        except ValueError as err:
+            raise PactError("invalid_request", str(err)) from err
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "owner")
+            if await fetchone(conn, "SELECT 1 FROM humans WHERE id = %s", (human,)) is None:
+                raise PactError("not_found", f"{human} is not a registered human")
+            if await fetchone(conn, "SELECT 1 FROM trusted_roots WHERE principal = %s", (raw,)):
+                raise PactError("invalid_request", "this key is already a trusted root (a revoked one cannot come back)")
+            await conn.execute(
+                "INSERT INTO trusted_roots (principal, human, label, created_by) VALUES (%s, %s, %s, %s)", (raw, human, label, by)
+            )
+            principal = b64url(raw)
+            await self._log(conn, by, "admin.trusted_root.add", {"principal": principal, "human": human, "label": label})
+        return {"principal": principal, "human": human, "label": label}
+
+    async def revoke_trusted_root(self, principal: str, *, by: str) -> int:
+        """Stop trusting a key. Every mandate imported under it fails its chain check from now on."""
+        try:
+            raw = b64url_decode(principal.strip())
+        except ValueError as err:
+            raise PactError("invalid_request", "a principal is base64url of a 32-byte public key") from err
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "owner")
+            cur = await conn.execute(
+                "UPDATE trusted_roots SET revoked_at = now() WHERE principal = %s AND revoked_at IS NULL", (raw,)
+            )
+            if cur.rowcount == 0 and await fetchone(conn, "SELECT 1 FROM trusted_roots WHERE principal = %s", (raw,)) is None:
+                raise PactError("not_found", f"{principal} is not a trusted root")
+            await self._log(conn, by, "admin.trusted_root.revoke", {"principal": principal})
+            return cur.rowcount
+
+    async def list_trusted_roots(self) -> list[dict[str, Any]]:
+        async with transaction(self.pool) as conn:
+            rows = await fetchall(
+                conn,
+                "SELECT principal, human, label, created_by, created_at, revoked_at FROM trusted_roots ORDER BY created_at",
+            )
+        return [{**r, "principal": b64url(bytes(r["principal"]))} for r in rows]
+
+    async def import_credential(self, agent_id: str, format_name: str, credential: str, *, by: str) -> str:
+        """Turn an outside credential held by ``agent_id`` into a root mandate in the ledger.
+
+        The credential must be rooted at a live trusted root; the mandate's issuer is the human
+        that root stands for, so the chain still traces to a person. The credential's holder must
+        be one of the agent's live registered keys (so the agent holds the private key), and every
+        scope must fall within the agent's projects. People do this, never agents: no MCP tool
+        reaches it.
+        """
+        fmt = credentials.get(format_name)
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            if await get_agent(conn, agent_id) is None:
+                raise PactError("not_found", f"agent {agent_id} does not exist")
+            roots = [
+                credentials.TrustedRoot(principal=b64url(bytes(r["principal"])), human=r["human"])
+                for r in await fetchall(conn, "SELECT principal, human FROM trusted_roots WHERE revoked_at IS NULL")
+            ]
+            got = fmt.ingest(credential.strip().encode(), trusted_roots=roots)
+            keys = {
+                b64url(bytes(r["public_key"]))
+                for r in await fetchall(
+                    conn, "SELECT public_key FROM agent_keys WHERE agent_id = %s AND revoked_at IS NULL", (agent_id,)
+                )
+            }
+            if got.holder_key is None or got.holder_key not in keys:
+                raise PactError("invalid_request", f"the credential is held by {got.holder_key}, not a live key of {agent_id}")
+            projects = {p.id for p in await agent_projects(conn, agent_id)}
+            foreign = [s for s in got.scope if s.split("@project:", 1)[-1] not in projects]
+            if foreign:
+                raise PactError("project_mismatch", f"{agent_id} is not registered in: {', '.join(foreign)}")
+            dup = await fetchone(
+                conn,
+                "SELECT id FROM mandates WHERE coalesce(exported_as, format) = %s AND external_id = %s",
+                (got.format, got.external_id),
+            )
+            if dup:
+                raise PactError("invalid_request", f"credential {got.external_id} is already on the board as mandate {dup['id']}")
+            m = await issue_root(
+                conn,
+                human=got.human,
+                holder=agent_id,
+                scope=got.scope,
+                limits=got.limits,
+                delegations=min(MAX_DEPTH, got.delegations),
+                expires_at=got.expires_at,
+                imported=ImportedLink(
+                    format=got.format,
+                    external_id=got.external_id,
+                    credential=got.credential,
+                    issuer_principal=got.issuer_principal,
+                ),
+            )
+            await self._log(
+                conn,
+                by,
+                "admin.credential.import",
+                {
+                    "agent": agent_id,
+                    "format": got.format,
+                    "external_id": got.external_id,
+                    "issuer_principal": got.issuer_principal,
+                    "human": got.human,
+                    "scope": got.scope,
+                    "limits": got.limits,
+                    "delegations": m.delegations_left,
+                },
+                mandate_chain=[m.id],
+            )
+            return m.id
 
     async def issue_mandate(
         self,

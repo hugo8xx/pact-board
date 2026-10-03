@@ -204,7 +204,7 @@ async def test_minting_refuses_with_the_codes_agents_know(world: World) -> None:
     assert info.value.code == "invalid_request" and "cannot be exported" in info.value.message
     with pytest.raises(PactError) as info:
         TenuoFormat().ingest(b"", trusted_roots=[])
-    assert info.value.code == "invalid_request" and "phase 2" in info.value.message
+    assert info.value.code == "invalid_request"  # not a warrant stack
 
 
 async def test_an_export_failure_never_fails_the_claim(world: World, monkeypatch: pytest.MonkeyPatch) -> None:

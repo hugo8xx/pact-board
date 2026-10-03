@@ -56,6 +56,8 @@ class Imported:
     scope: list[str]
     limits: Limits
     expires_at: datetime
+    delegations: int = 0
+    """How many more links the holder may delegate below the imported mandate (0: terminal)."""
 
 
 class CredentialFormat(Protocol):

@@ -10,7 +10,7 @@ from psycopg.types.json import Jsonb
 from .crypto import canonical_json, hmac_equals, hmac_hex, iso, signing_key
 from .db import Conn, fetchall, fetchone
 from .errors import PactError
-from .keys import keyring
+from .keys import b64url, b64url_decode, keyring
 from .scope import uncovered
 
 MAX_DEPTH = 5
@@ -36,6 +36,8 @@ class Mandate:
     format: str = "pact"
     """Where this link came from: ``pact`` for one the board issued, else the credential format it was imported from."""
     external_id: str | None = None
+    issuer_principal: str | None = None
+    """For an imported link: base64url of the outside key (a trusted root) that issued the credential."""
 
     @classmethod
     def from_row(cls, r: dict[str, Any]) -> "Mandate":
@@ -54,6 +56,7 @@ class Mandate:
             signature=r["signature"],
             format=r.get("format") or "pact",
             external_id=r.get("external_id"),
+            issuer_principal=r.get("issuer_principal"),
         )
 
 
@@ -74,7 +77,7 @@ class Chain:
 
 _COLUMNS = (
     "id, parent_id, issuer_kind, issuer, holder, scope, limits, delegations_left, depth, expires_at, revoked_at, signature, "
-    "format, external_id"
+    "format, external_id, issuer_principal"
 )
 
 
@@ -90,10 +93,19 @@ def _payload(
     delegations_left: int,
     depth: int,
     expires_at: datetime,
+    imported: tuple[str, str | None, str | None] | None = None,
 ) -> str:
-    """The canonical bytes a mandate's signature covers: every field but revoked_at and the signature."""
+    """The canonical bytes a mandate's signature covers: every field but revoked_at and the signature.
+
+    ``imported`` is (format, external_id, issuer_principal) of a link imported from an outside
+    credential. It is signed too, so the trusted root a link answers to cannot be swapped in the
+    database; board-issued links leave it out and keep their payload unchanged."""
+    extra = {}
+    if imported is not None:
+        extra = {"format": imported[0], "external_id": imported[1], "issuer_principal": imported[2]}
     return canonical_json(
         {
+            **extra,
             "id": id,
             "parent_id": parent_id,
             "issuer_kind": issuer_kind,
@@ -120,6 +132,7 @@ def payload_of(m: Mandate) -> str:
         delegations_left=m.delegations_left,
         depth=m.depth,
         expires_at=m.expires_at,
+        imported=None if m.format == "pact" else (m.format, m.external_id, m.issuer_principal),
     )
 
 
@@ -144,9 +157,11 @@ async def _insert(
     delegations_left: int,
     depth: int,
     expires_at: datetime,
+    imported: "ImportedLink | None" = None,
 ) -> Mandate:
     # Postgres keeps microseconds; trim nothing, but pin the zone so the signature round-trips.
     expires_at = expires_at.astimezone(UTC)
+    fmt = imported.format if imported else "pact"
     m = Mandate(
         id=str(uuid4()),
         parent_id=parent_id,
@@ -160,20 +175,60 @@ async def _insert(
         expires_at=expires_at,
         revoked_at=None,
         signature="",
+        format=fmt,
+        external_id=imported.external_id if imported else None,
+        issuer_principal=imported.issuer_principal if imported else None,
     )
     sig = keyring().sign(payload_of(m))
     await conn.execute(
         """INSERT INTO mandates (id, parent_id, issuer_kind, issuer, holder, scope, limits, delegations_left, depth,
-                                 expires_at, signature)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-        (m.id, parent_id, issuer_kind, issuer, holder, scope, Jsonb(limits), delegations_left, depth, expires_at, sig),
+                                 expires_at, signature, format, external_id, credential, issuer_principal)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+        (
+            m.id,
+            parent_id,
+            issuer_kind,
+            issuer,
+            holder,
+            scope,
+            Jsonb(limits),
+            delegations_left,
+            depth,
+            expires_at,
+            sig,
+            fmt,
+            m.external_id,
+            imported.credential if imported else None,
+            m.issuer_principal,
+        ),
     )
     return Mandate(**{**m.__dict__, "signature": sig})
 
 
+@dataclass(frozen=True)
+class ImportedLink:
+    """Where a root mandate came from when it was imported from an outside credential."""
+
+    format: str
+    external_id: str
+    credential: bytes
+    issuer_principal: str
+
+
 async def issue_root(
-    conn: Conn, *, human: str, holder: str, scope: list[str], limits: Limits, delegations: int, expires_at: datetime
+    conn: Conn,
+    *,
+    human: str,
+    holder: str,
+    scope: list[str],
+    limits: Limits,
+    delegations: int,
+    expires_at: datetime,
+    imported: ImportedLink | None = None,
 ) -> Mandate:
+    """A root mandate issued by ``human``. With ``imported``, the root of an outside credential
+    whose trusted root stands for ``human``; the board still signs the row, so every link is
+    checked the same way."""
     if not 0 <= delegations <= MAX_DEPTH:
         raise PactError("invalid_request", f"delegations must be between 0 and {MAX_DEPTH}")
     return await _insert(
@@ -187,6 +242,7 @@ async def issue_root(
         delegations_left=delegations,
         depth=0,
         expires_at=expires_at,
+        imported=imported,
     )
 
 
@@ -290,6 +346,7 @@ async def verify_chain(conn: Conn, leaf_id: str, holder: str, now: datetime | No
     for m in links:
         if m.revoked_at:
             raise PactError("mandate_revoked", f"mandate {m.id} in the chain was revoked", m.id)
+    await _check_trusted_roots(conn, links)
     for m in links:
         if m.expires_at <= now:
             raise PactError("mandate_expired", f"mandate {m.id} in the chain expired at {iso(m.expires_at)}", m.id)
@@ -298,6 +355,33 @@ async def verify_chain(conn: Conn, leaf_id: str, holder: str, now: datetime | No
     if leaf.holder != holder:
         raise PactError("chain_broken", f"mandate {leaf.id} is held by {leaf.holder}, not by the caller {holder}", leaf.id)
     return Chain(links)
+
+
+async def _check_trusted_roots(conn: Conn, links: list[Mandate]) -> None:
+    """A link imported from an outside credential lives only while its issuing key is still a
+    trusted root standing for the human the link names as issuer."""
+    imported = [m for m in links if m.format != "pact" and m.issuer_principal]
+    if not imported:
+        return
+    principals = []
+    for m in imported:
+        try:
+            principals.append(b64url_decode(m.issuer_principal or ""))
+        except ValueError:
+            raise PactError("chain_broken", f"mandate {m.id} names an unreadable issuer key", m.id) from None
+    live = {
+        (b64url(bytes(r["principal"])), r["human"])
+        for r in await fetchall(
+            conn,
+            "SELECT principal, human FROM trusted_roots WHERE principal = ANY(%s) AND revoked_at IS NULL",
+            (principals,),
+        )
+    }
+    for m in imported:
+        if (m.issuer_principal, m.issuer) not in live:
+            raise PactError(
+                "mandate_revoked", f"mandate {m.id} was imported under key {m.issuer_principal}, no longer a trusted root", m.id
+            )
 
 
 async def consume_limits(conn: Conn, chain: Chain, consumption: Limits) -> None:
