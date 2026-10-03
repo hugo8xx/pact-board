@@ -7,11 +7,13 @@ import argparse
 import asyncio
 import json
 import sys
+from datetime import UTC, datetime
 from typing import Any
 
 from .admin import Admin
 from .db import create_pool, migrate
 from .errors import PactError
+from .keys import new_seed
 
 
 def _csv(value: str) -> list[str]:
@@ -67,6 +69,16 @@ def _parser() -> argparse.ArgumentParser:
     tr.add_argument("agent")
     tr.add_argument("--by", required=True)
 
+    ka = sub.add_parser("agent-key-add", help="register an agent's Ed25519 public key (code and runner agents only)")
+    ka.add_argument("agent")
+    ka.add_argument("public_key", help="base64url of the raw 32-byte public key")
+    ka.add_argument("--by", required=True)
+    kr = sub.add_parser("agent-key-revoke")
+    kr.add_argument("agent")
+    kr.add_argument("kid")
+    kr.add_argument("--by", required=True)
+    sub.add_parser("key-new", help="print a fresh entry for PACT_BOARD_KEYS; put it first to rotate the board's signing key")
+
     mi = sub.add_parser("mandate-issue")
     mi.add_argument("holder")
     mi.add_argument("--by", required=True)
@@ -96,6 +108,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 async def _run(args: argparse.Namespace) -> Any:
+    if args.cmd == "key-new":  # needs no database
+        return {"entry": f"{datetime.now(UTC):%Y%m%d}={new_seed()}", "how": "prepend to PACT_BOARD_KEYS; keep old entries"}
     pool = create_pool()
     await pool.open()
     try:
@@ -129,6 +143,10 @@ async def _run(args: argparse.Namespace) -> Any:
                 await a.set_agent_status(args.id, args.status, by=args.by)
             case "token-issue":
                 return {"token": await a.issue_token(args.agent, by=args.by, days=args.days)}
+            case "agent-key-add":
+                return await a.add_agent_key(args.agent, args.public_key, by=args.by)
+            case "agent-key-revoke":
+                return {"revoked": await a.revoke_agent_key(args.agent, args.kid, by=args.by)}
             case "token-revoke":
                 return {"revoked": await a.revoke_tokens(args.agent, by=args.by)}
             case "mandate-issue":

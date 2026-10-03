@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 from .crypto import canonical_json, hmac_equals, hmac_hex, iso, signing_key
 from .db import Conn, fetchall, fetchone
 from .errors import PactError
+from .keys import keyring
 from .scope import uncovered
 
 MAX_DEPTH = 5
@@ -32,6 +33,9 @@ class Mandate:
     expires_at: datetime
     revoked_at: datetime | None
     signature: str
+    format: str = "pact"
+    """Where this link came from: ``pact`` for one the board issued, else the credential format it was imported from."""
+    external_id: str | None = None
 
     @classmethod
     def from_row(cls, r: dict[str, Any]) -> "Mandate":
@@ -48,6 +52,8 @@ class Mandate:
             expires_at=r["expires_at"],
             revoked_at=r["revoked_at"],
             signature=r["signature"],
+            format=r.get("format") or "pact",
+            external_id=r.get("external_id"),
         )
 
 
@@ -66,10 +72,13 @@ class Chain:
         return [m.id for m in self.links]
 
 
-_COLUMNS = "id, parent_id, issuer_kind, issuer, holder, scope, limits, delegations_left, depth, expires_at, revoked_at, signature"
+_COLUMNS = (
+    "id, parent_id, issuer_kind, issuer, holder, scope, limits, delegations_left, depth, expires_at, revoked_at, signature, "
+    "format, external_id"
+)
 
 
-def _signature(
+def _payload(
     *,
     id: str,
     parent_id: str | None,
@@ -82,27 +91,25 @@ def _signature(
     depth: int,
     expires_at: datetime,
 ) -> str:
-    return hmac_hex(
-        signing_key(),
-        canonical_json(
-            {
-                "id": id,
-                "parent_id": parent_id,
-                "issuer_kind": issuer_kind,
-                "issuer": issuer,
-                "holder": holder,
-                "scope": scope,
-                "limits": limits,
-                "delegations_left": delegations_left,
-                "depth": depth,
-                "expires_at": iso(expires_at),
-            }
-        ),
+    """The canonical bytes a mandate's signature covers: every field but revoked_at and the signature."""
+    return canonical_json(
+        {
+            "id": id,
+            "parent_id": parent_id,
+            "issuer_kind": issuer_kind,
+            "issuer": issuer,
+            "holder": holder,
+            "scope": scope,
+            "limits": limits,
+            "delegations_left": delegations_left,
+            "depth": depth,
+            "expires_at": iso(expires_at),
+        }
     )
 
 
-def _signature_of(m: Mandate) -> str:
-    return _signature(
+def payload_of(m: Mandate) -> str:
+    return _payload(
         id=m.id,
         parent_id=m.parent_id,
         issuer_kind=m.issuer_kind,
@@ -114,6 +121,15 @@ def _signature_of(m: Mandate) -> str:
         depth=m.depth,
         expires_at=m.expires_at,
     )
+
+
+def signature_valid(m: Mandate) -> bool:
+    """Ed25519 under any key in the board's keyring; mandates issued before Ed25519 carry an
+    HMAC under PACT_SIGNING_KEY and keep verifying that way until they expire."""
+    payload = payload_of(m)
+    if m.signature.startswith("ed25519:"):
+        return keyring().verify(payload, m.signature)
+    return hmac_equals(m.signature, hmac_hex(signing_key(), payload))
 
 
 async def _insert(
@@ -145,7 +161,7 @@ async def _insert(
         revoked_at=None,
         signature="",
     )
-    sig = _signature_of(m)
+    sig = keyring().sign(payload_of(m))
     await conn.execute(
         """INSERT INTO mandates (id, parent_id, issuer_kind, issuer, holder, scope, limits, delegations_left, depth,
                                  expires_at, signature)
@@ -244,7 +260,7 @@ async def verify_chain(conn: Conn, leaf_id: str, holder: str, now: datetime | No
         raise PactError("chain_broken", f"root mandate {root.id} was not issued by a registered human", root.id)
 
     for i, m in enumerate(links):
-        if not hmac_equals(m.signature, _signature_of(m)):
+        if not signature_valid(m):
             raise PactError("chain_broken", f"signature of mandate {m.id} does not match its contents", m.id)
         if i == 0:
             if m.depth != 0:

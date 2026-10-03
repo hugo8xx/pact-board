@@ -33,6 +33,14 @@ UI is read-only for agents. Notes are redacted, versioned, erasable (PDPA), and 
 with their author, never as instructions. They are also MCP resources:
 `pact://projects/<p>/context` and `pact://projects/<p>/context/<key>`. `pact_whoami` lists their titles.
 
+**Signatures and credentials.** The board signs every mandate with Ed25519 and publishes the public
+keys at `/.well-known/pact-keys.json`, so a verifier elsewhere can check what the board issued. To
+rotate, put a new `PACT_BOARD_KEYS` entry first and keep the old one until the mandates it signed have
+expired. Mandates signed before Ed25519 (an HMAC under `PACT_SIGNING_KEY`) keep verifying. The ledger
+stays the source of truth; `pact.credentials` is the interface that exports it as, or imports it from,
+standard delegation credentials (Tenuo first, then Biscuit). Agents that hold exported credentials
+register an Ed25519 public key (`pact-admin agent-key-add`, code and runner agents only).
+
 **Handoff.** `pact_report` with `completed`, `failed` or `canceled` must carry a handoff in `result`:
 a markdown section headed `Handoff` (what was done; repo / branch / PR / commit; checks; what is left;
 what needs a human; links), or an object with a `handoff` key. Without it the board refuses with
@@ -130,7 +138,8 @@ it, work already delegated under the old one carries on until it expires.
 | Variable | Required | Meaning |
 | --- | --- | --- |
 | `DATABASE_URL` | yes | Postgres connection string |
-| `PACT_SIGNING_KEY` | yes | ≥ 32 random characters; signs mandates. Changing it invalidates every mandate |
+| `PACT_SIGNING_KEY` | yes | ≥ 32 random characters. Verifies mandates signed before Ed25519 and, without `PACT_BOARD_KEYS`, seeds the board's Ed25519 key |
+| `PACT_BOARD_KEYS` | no | the board's Ed25519 keyring, `kid=<base64url 32-byte seed>` entries separated by commas, newest first. The first signs; all verify. `pact-admin key-new` prints an entry |
 | `PACT_PUBLIC_URL` | yes in production | this server's public URL, e.g. `https://board.example.com` |
 | `PACT_AUTH_ISSUER` | for the hosted Claude apps | your authorization server's issuer URL; unset = agent tokens only |
 | `PACT_ADMIN_REQUIRE_MFA` | no | default `1`; set `0` only if your issuer never reports `amr` |
