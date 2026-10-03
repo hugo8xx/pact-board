@@ -61,6 +61,27 @@ warrant minted for it and for everything under it on a signed revocation list, p
 `x-pact-revocations-version`). Verifiers must refetch it at least every 60 seconds and must fail
 closed, refusing every call, when they cannot.
 
+**Imported credentials (Tenuo).** An organization that issues its own Tenuo warrants can give one
+to a PACT agent, and the board turns it into a root mandate. First an owner registers the
+organization's Ed25519 key as a **trusted root** standing for a registered person
+(`pact-admin trusted-root-add <key> --human <id>`, or `POST /admin/api/trusted-roots`
+`{public_key, human, label}`; list with `GET`, revoke with `DELETE /admin/api/trusted-roots/{key}`).
+Then an approver imports the warrant stack for an agent (`pact-admin credential-import <agent>
+<stack>`, or `POST /admin/api/agents/{id}/credentials` `{format: "tenuo", credential}`). Agents
+can never import for themselves: there is no MCP tool for it. The board verifies the stack against
+live trusted roots only (signatures, linkage, attenuation, expiry; anything else is
+`chain_broken`), and requires the leaf's holder to be one of the agent's live registered keys and
+every scope to fall within the agent's projects (`project_mismatch`). The new root mandate's issuer
+is the trusted root's person, so its entries trace to a human; it expires with the warrant, and may
+delegate twice on the board (0 when the leaf is terminal, never more than Tenuo's remaining depth).
+Mapping is the export's in reverse: tool `T` with `project` `Exact(P)` or `OneOf([P, …])` becomes
+`T@project:P`; each `Range.max_value(v)` becomes a limit (the tightest across tools); `task_id` may
+be `Wildcard`. Anything else is refused with `invalid_request` rather than dropped, since dropping
+a constraint would widen what the issuer granted: a tool without `project`, a wildcard tool name,
+other constraint types (`Pattern`, `Range` with a minimum, …), other arguments, outside approvals.
+Revoking the trusted root stops every mandate imported under it (`mandate_revoked`); an agent's
+`pact_revoke` of an imported root gets `not_issuer`, and people revoke it like any root mandate.
+
 **Handoff.** `pact_report` with `completed`, `failed` or `canceled` must carry a handoff in `result`:
 a markdown section headed `Handoff` (what was done; repo / branch / PR / commit; checks; what is left;
 what needs a human; links), or an object with a `handoff` key. Without it the board refuses with
@@ -141,7 +162,8 @@ agent tokens only. The script reports what the board cannot see in `X-Pact-Auto-
 `/admin/api/*` is for people, not agents: it takes an OAuth access token whose audience is
 `<PACT_PUBLIC_URL>/admin`, signed in with a second factor (`amr` contains `mfa`). Agent tokens and
 tokens minted for agent URLs are refused. Roles: owners do everything (kill switch, production
-flag, freezing, banning); approvers approve tasks, register agents and issue or revoke mandates;
+flag, freezing, banning, trusted roots); approvers approve tasks, register agents, issue or revoke
+mandates and import credentials;
 viewers read. The UI lives in its own repo, [hugo8xx/pact-admin](https://github.com/hugo8xx/pact-admin).
 
 Before revoking, `GET /admin/api/mandates/{id}/impact` shows what would go with it (mandates below,
