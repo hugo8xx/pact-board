@@ -373,6 +373,25 @@ class AdminApi:
         p = request.path_params
         return {"revoked": await self.admin.revoke_agent_key(p["agent_id"], p["kid"], by=human)}
 
+    async def trusted_roots(self, _r: Request, _h: str) -> Any:
+        return await self.admin.list_trusted_roots()
+
+    async def add_trusted_root(self, request: Request, human: str) -> Any:
+        b = await _body(request)
+        return await self.admin.add_trusted_root(
+            str(b.get("public_key", "")), human=str(b.get("human", "")), by=human, label=b.get("label") or None
+        )
+
+    async def revoke_trusted_root(self, request: Request, human: str) -> Any:
+        return {"revoked": await self.admin.revoke_trusted_root(request.path_params["principal"], by=human)}
+
+    async def import_credential(self, request: Request, human: str) -> Any:
+        b = await _body(request)
+        mandate_id = await self.admin.import_credential(
+            request.path_params["agent_id"], str(b.get("format", "")), str(b.get("credential", "")), by=human
+        )
+        return {"mandate_id": mandate_id}
+
     async def issue_mandate(self, request: Request, human: str) -> Any:
         b = await _body(request)
         return {
@@ -456,6 +475,10 @@ def build_admin_app(pool: AsyncConnectionPool[Conn], verifier: Verifier) -> Star
             Route(f"{p}/agents/{{agent_id}}/keys", r(a.agent_keys)),
             Route(f"{p}/agents/{{agent_id}}/keys", r(a.add_agent_key), methods=["POST"]),
             Route(f"{p}/agents/{{agent_id}}/keys/{{kid}}", r(a.revoke_agent_key), methods=["DELETE"]),
+            Route(f"{p}/agents/{{agent_id}}/credentials", r(a.import_credential), methods=["POST"]),
+            Route(f"{p}/trusted-roots", r(a.trusted_roots)),
+            Route(f"{p}/trusted-roots", r(a.add_trusted_root), methods=["POST"]),
+            Route(f"{p}/trusted-roots/{{principal}}", r(a.revoke_trusted_root), methods=["DELETE"]),
             Route(f"{p}/mandates", r(a.mandates)),
             Route(f"{p}/mandates", r(a.issue_mandate), methods=["POST"]),
             Route(f"{p}/mandates/{{mandate_id}}/impact", r(a.mandate_impact)),

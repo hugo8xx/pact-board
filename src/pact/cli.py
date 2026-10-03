@@ -79,6 +79,21 @@ def _parser() -> argparse.ArgumentParser:
     kr.add_argument("--by", required=True)
     sub.add_parser("key-new", help="print a fresh entry for PACT_BOARD_KEYS; put it first to rotate the board's signing key")
 
+    ta = sub.add_parser("trusted-root-add", help="trust an outside Ed25519 key to issue credentials for a person (owner)")
+    ta.add_argument("public_key", help="base64url of the raw 32-byte public key")
+    ta.add_argument("--human", required=True, help="the registered person this key stands for")
+    ta.add_argument("--label")
+    ta.add_argument("--by", required=True)
+    trr = sub.add_parser("trusted-root-revoke", help="stop trusting a key; mandates imported under it stop working")
+    trr.add_argument("principal")
+    trr.add_argument("--by", required=True)
+    sub.add_parser("trusted-root-list")
+    ci = sub.add_parser("credential-import", help="turn an outside credential an agent holds into a root mandate")
+    ci.add_argument("agent")
+    ci.add_argument("credential", help="the credential as text (a Tenuo warrant stack is base64)")
+    ci.add_argument("--format", default="tenuo")
+    ci.add_argument("--by", required=True)
+
     mi = sub.add_parser("mandate-issue")
     mi.add_argument("holder")
     mi.add_argument("--by", required=True)
@@ -147,6 +162,14 @@ async def _run(args: argparse.Namespace) -> Any:
                 return await a.add_agent_key(args.agent, args.public_key, by=args.by)
             case "agent-key-revoke":
                 return {"revoked": await a.revoke_agent_key(args.agent, args.kid, by=args.by)}
+            case "trusted-root-add":
+                return await a.add_trusted_root(args.public_key, human=args.human, by=args.by, label=args.label)
+            case "trusted-root-revoke":
+                return {"revoked": await a.revoke_trusted_root(args.principal, by=args.by)}
+            case "trusted-root-list":
+                return await a.list_trusted_roots()
+            case "credential-import":
+                return {"mandate_id": await a.import_credential(args.agent, args.format, args.credential, by=args.by)}
             case "token-revoke":
                 return {"revoked": await a.revoke_tokens(args.agent, by=args.by)}
             case "mandate-issue":

@@ -18,6 +18,12 @@ Mapping per link:
   Tenuo denies unknown arguments, and every constrained argument must be present on each call
   (project, task_id and each limit key).
 - TTL = seconds until the link expires, at most Tenuo's 90 days; a child never outlives its parent.
+
+Import (``ingest``) runs the mapping backwards on the leaf of a stack whose root was signed by a
+trusted root: each tool's ``project`` (``Exact`` or ``OneOf``) gives ``tool@project:P`` scopes,
+each ``Range.max_value`` a limit (the tightest across tools, since a ledger limit covers every
+tool), ``task_id`` may only be ``Wildcard``. Anything the ledger cannot hold is refused rather than
+dropped, because dropping a constraint would widen the authority the issuer granted.
 """
 
 import os
@@ -27,12 +33,14 @@ from typing import Any
 
 from tenuo import (
     MAX_WARRANT_TTL_SECS,
+    Authorizer,
     Exact,
     OneOf,
     PublicKey,
     Range,
     SigningKey,
     SrlBuilder,
+    TenuoError,
     Warrant,
     Wildcard,
     decode_warrant_stack_base64,
@@ -40,7 +48,7 @@ from tenuo import (
 )
 
 from ..errors import PactError
-from ..keys import Keyring, b64url_decode, public_bytes
+from ..keys import Keyring, b64url, b64url_decode, public_bytes
 from ..mandates import Chain, Limits, Mandate
 from ..scope import parse_board_scope
 from . import Exported, Imported, TrustedRoot
@@ -48,6 +56,9 @@ from . import Exported, Imported, TrustedRoot
 NAME = "tenuo"
 FREE_ARGS = ("task_id",)
 """Arguments any value may take. Everything else a verifier's tool receives must be constrained."""
+IMPORT_DELEGATIONS = 2
+"""Delegations an imported, non-terminal warrant grants on the board: the same as a fresh
+registration, and never more than the warrant's own remaining Tenuo depth."""
 
 
 def signing_key(keyring: Keyring) -> SigningKey:
@@ -168,7 +179,51 @@ class TenuoFormat:
         return gb.grant(board)
 
     def ingest(self, credential: bytes, *, trusted_roots: Sequence[TrustedRoot]) -> Imported:
-        raise PactError("invalid_request", "importing Tenuo warrants comes in phase 2")
+        """Verify a warrant stack against ``trusted_roots`` only and map its leaf to a mandate."""
+        try:
+            chain = decode_warrant_stack_base64(credential.decode().strip())
+        except (TenuoError, ValueError) as err:
+            if "signature" in str(err):  # decoding checks each warrant's signature
+                raise PactError("chain_broken", f"the warrant stack does not verify: {err}") from None
+            raise PactError("invalid_request", f"not a Tenuo warrant stack: {err}") from None
+        if not chain:
+            raise PactError("invalid_request", "the warrant stack is empty")
+        humans = {}
+        for root in trusted_roots:
+            try:
+                humans[b64url_decode(root.principal)] = root.human
+            except ValueError:
+                continue
+        roots = [PublicKey.from_bytes(k) for k in humans]
+        issuer = chain[0].issuer.to_bytes()
+        if issuer not in humans:
+            raise PactError("chain_broken", f"the warrant stack is rooted at {b64url(issuer)}, which is not a trusted root")
+        try:
+            Authorizer(trusted_roots=roots).verify_chain(chain)
+        except TenuoError as err:
+            raise PactError("chain_broken", f"the warrant stack does not verify: {err}") from None
+        expired = [w.id for w in chain if w.is_expired()]
+        if expired:  # verify_chain checks signatures and linkage, not expiry
+            raise PactError("chain_broken", f"warrant {expired[0]} in the stack has expired")
+        leaf = chain[-1]
+        if str(leaf.warrant_type) != "WarrantType.Execution":
+            raise PactError("invalid_request", f"warrant {leaf.id} is a {leaf.warrant_type} warrant, not an execution warrant")
+        if leaf.requires_multisig():
+            raise PactError("invalid_request", f"warrant {leaf.id} needs outside approvals, which the board cannot check")
+        scope, limits = to_ledger(leaf.capabilities)
+        delegations = 0 if leaf.is_terminal() else max(0, min(IMPORT_DELEGATIONS, leaf.max_depth - leaf.depth))
+        return Imported(
+            format=NAME,
+            external_id=leaf.id,
+            credential=credential.strip(),
+            issuer_principal=b64url(issuer),
+            human=humans[issuer],
+            holder_key=b64url(leaf.authorized_holder.to_bytes()),
+            scope=scope,
+            limits=limits,
+            expires_at=datetime.fromisoformat(leaf.expires_at()).astimezone(UTC),
+            delegations=delegations,
+        )
 
     def revocation_ids(self, credential: bytes) -> list[str]:
         return [w.id for w in decode_warrant_stack_base64(credential.decode())]
@@ -178,6 +233,43 @@ class TenuoFormat:
         for warrant_id in revoked:
             builder = builder.revoke(warrant_id)
         return bytes(builder.version(version).build(signing_key(keyring)).to_bytes())
+
+
+def _projects(tool: str, constraint: Any) -> list[str]:
+    if isinstance(constraint, Exact) and isinstance(constraint.value, str):
+        return [constraint.value]
+    if isinstance(constraint, OneOf) and constraint.values and all(isinstance(v, str) for v in constraint.values):
+        return list(constraint.values)
+    raise PactError("invalid_request", f"{tool}: project must be Exact or OneOf project ids, not {constraint!r}")
+
+
+def to_ledger(caps: Mapping[str, Mapping[str, Any]]) -> tuple[list[str], Limits]:
+    """A leaf warrant's capabilities as ledger scope and limits; ``invalid_request`` for anything else."""
+    if not caps:
+        raise PactError("invalid_request", "the warrant grants no tools")
+    scope: list[str] = []
+    limits: Limits = {}
+    for tool, cons in caps.items():
+        if "*" in tool:
+            raise PactError("invalid_request", f"tool {tool!r} is a wildcard; an imported warrant names each tool")
+        if "project" not in cons:
+            raise PactError("invalid_request", f"tool {tool} has no project constraint, so it would reach every project")
+        for p in _projects(tool, cons["project"]):
+            s = f"{tool}@project:{p}"
+            if parse_board_scope(s) is None:
+                raise PactError("invalid_request", f"{tool} on project {p!r} is not a board scope")
+            if s not in scope:
+                scope.append(s)
+        for key, c in cons.items():
+            if key == "project":
+                continue
+            if key in FREE_ARGS and isinstance(c, Wildcard):
+                continue
+            if isinstance(c, Range) and c.min is None and c.max is not None and key not in FREE_ARGS:
+                limits[key] = min(float(c.max), limits.get(key, float(c.max)))
+                continue
+            raise PactError("invalid_request", f"{tool}.{key}={c!r} has no ledger equivalent (only Range.max_value limits)")
+    return sorted(scope), limits
 
 
 def warrant_stack(exported: Exported) -> str:
