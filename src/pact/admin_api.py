@@ -356,6 +356,23 @@ class AdminApi:
     async def revoke_tokens(self, request: Request, human: str) -> Any:
         return {"revoked": await self.admin.revoke_tokens(request.path_params["agent_id"], by=human)}
 
+    async def agent_keys(self, request: Request, _h: str) -> Any:
+        async with transaction(self.pool) as conn:
+            return await fetchall(
+                conn,
+                """SELECT kid, encode(public_key, 'base64') AS public_key_b64, created_at, created_by, revoked_at
+                   FROM agent_keys WHERE agent_id = %s ORDER BY created_at""",
+                (request.path_params["agent_id"],),
+            )
+
+    async def add_agent_key(self, request: Request, human: str) -> Any:
+        b = await _body(request)
+        return await self.admin.add_agent_key(request.path_params["agent_id"], str(b.get("public_key", "")), by=human)
+
+    async def revoke_agent_key(self, request: Request, human: str) -> Any:
+        p = request.path_params
+        return {"revoked": await self.admin.revoke_agent_key(p["agent_id"], p["kid"], by=human)}
+
     async def issue_mandate(self, request: Request, human: str) -> Any:
         b = await _body(request)
         return {
@@ -436,6 +453,9 @@ def build_admin_app(pool: AsyncConnectionPool[Conn], verifier: Verifier) -> Star
             Route(f"{p}/agents/{{agent_id}}/status", r(a.agent_status), methods=["POST"]),
             Route(f"{p}/agents/{{agent_id}}/tokens", r(a.issue_token), methods=["POST"]),
             Route(f"{p}/agents/{{agent_id}}/tokens", r(a.revoke_tokens), methods=["DELETE"]),
+            Route(f"{p}/agents/{{agent_id}}/keys", r(a.agent_keys)),
+            Route(f"{p}/agents/{{agent_id}}/keys", r(a.add_agent_key), methods=["POST"]),
+            Route(f"{p}/agents/{{agent_id}}/keys/{{kid}}", r(a.revoke_agent_key), methods=["DELETE"]),
             Route(f"{p}/mandates", r(a.mandates)),
             Route(f"{p}/mandates", r(a.issue_mandate), methods=["POST"]),
             Route(f"{p}/mandates/{{mandate_id}}/impact", r(a.mandate_impact)),

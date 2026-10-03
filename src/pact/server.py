@@ -25,6 +25,7 @@ from .db import Conn, create_pool, transaction
 from .errors import PactError
 from .hooks import EVENTS as HOOK_EVENTS
 from .hooks import handle as handle_hook
+from .keys import keyring
 from .notify import SlackSender
 from .oauth import ResourceSettings, TokenRejected, Verifier, agent_for_oauth
 
@@ -265,6 +266,7 @@ def admin_api_on_board() -> bool:
 
 
 _HOOK_PATH = re.compile(r"^/hooks/a/([a-z0-9][a-z0-9-]{0,62})/([a-z-]+)$")
+KEYS_PATH = "/.well-known/pact-keys.json"
 _METADATA_PATH = re.compile(r"^/\.well-known/oauth-protected-resource/mcp/a/([a-z0-9][a-z0-9-]{0,62})/?$")
 
 
@@ -295,6 +297,10 @@ class PactApp:
         path: str = scope["path"]
         if path == "/healthz":
             await _respond(send, 200, {"ok": True})
+            return
+        if path == KEYS_PATH:
+            # Public keys only: anyone may verify what the board signed.
+            await _respond(send, 200, keyring().jwks(), extra_headers=[(b"access-control-allow-origin", b"*")])
             return
         if path.startswith("/admin/api/"):
             if not admin_api_on_board():

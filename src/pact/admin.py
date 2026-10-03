@@ -3,6 +3,7 @@
 Agents never reach this module: nothing here is exposed over MCP.
 """
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -22,6 +23,7 @@ from .crypto import new_token, sha256
 from .db import Conn, fetchall, fetchone, transaction
 from .entries import SYSTEM_CHAIN, EntryInput, append_entry, erase_payload, verify_entry_chain
 from .errors import PactError
+from .keys import b64url, public_key_from_text
 from .mandates import Limits, get_mandate, issue_root, revoke_impact, revoke_subtree
 from .scope import board_scope, is_valid_scope
 
@@ -30,6 +32,8 @@ _RANK: dict[str, int] = {"viewer": 0, "approver": 1, "owner": 2}
 
 DEFAULT_MANDATE_DAYS = 30
 DEFAULT_TOKEN_DAYS = 30
+KEY_CLIENTS: tuple[Client, ...] = ("code", "runner")
+"""Clients that hold an Ed25519 key for verifiers outside the board (owner decision 2026-10-02)."""
 
 
 def default_scope(client: Client, projects: list[str]) -> list[str]:
@@ -194,6 +198,44 @@ class Admin:
                 "UPDATE agent_tokens SET revoked_at = now() WHERE agent_id = %s AND revoked_at IS NULL", (agent_id,)
             )
             await self._log(conn, by, "admin.token.revoke", {"agent": agent_id})
+            return cur.rowcount
+
+    async def add_agent_key(self, agent_id: str, public_key: str, *, by: str) -> dict[str, Any]:
+        """Register an agent's Ed25519 public key (base64url of the raw 32 bytes).
+
+        Verifiers outside the board check each call against the holder's key, so an agent that
+        uses exported credentials needs one. Only code and runner agents run on machines that can
+        keep a private key; the Claude apps cannot, so they keep working through the board only.
+        """
+        try:
+            raw = public_key_from_text(public_key)
+        except ValueError as err:
+            raise PactError("invalid_request", str(err)) from err
+        kid = b64url(hashlib.sha256(raw).digest())[:16]
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            agent = await get_agent(conn, agent_id)
+            if agent is None:
+                raise PactError("not_found", f"agent {agent_id} does not exist")
+            if agent.client not in KEY_CLIENTS:
+                raise PactError("invalid_request", f"{agent.client} agents do not hold keys; only {', '.join(KEY_CLIENTS)} do")
+            taken = await fetchone(conn, "SELECT agent_id FROM agent_keys WHERE public_key = %s", (raw,))
+            if taken:
+                raise PactError("invalid_request", f"this public key is already registered for {taken['agent_id']}")
+            await conn.execute(
+                "INSERT INTO agent_keys (agent_id, kid, public_key, created_by) VALUES (%s, %s, %s, %s)", (agent_id, kid, raw, by)
+            )
+            await self._log(conn, by, "admin.agent_key.add", {"agent": agent_id, "kid": kid})
+        return {"agent_id": agent_id, "kid": kid}
+
+    async def revoke_agent_key(self, agent_id: str, kid: str, *, by: str) -> int:
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            cur = await conn.execute(
+                "UPDATE agent_keys SET revoked_at = now() WHERE agent_id = %s AND kid = %s AND revoked_at IS NULL",
+                (agent_id, kid),
+            )
+            await self._log(conn, by, "admin.agent_key.revoke", {"agent": agent_id, "kid": kid})
             return cur.rowcount
 
     async def issue_mandate(
