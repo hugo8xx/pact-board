@@ -19,8 +19,9 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from . import context as notes
+from . import credentials
 from .admin import Admin
-from .board import TERMINAL_STATUSES
+from .board import TERMINAL_STATUSES, export_format
 from .db import Conn, fetchall, fetchone, transaction
 from .errors import PactError
 from .oauth import TokenRejected, Verifier, human_for
@@ -155,7 +156,8 @@ class AdminApi:
                           (SELECT count(*) FROM agent_tokens t
                             WHERE t.agent_id = a.id AND t.revoked_at IS NULL AND t.expires_at > now()) AS live_tokens,
                           (SELECT count(*) FROM mandates m
-                            WHERE m.holder = a.id AND m.revoked_at IS NULL AND m.expires_at > now()) AS live_mandates
+                            WHERE m.holder = a.id AND m.revoked_at IS NULL AND m.expires_at > now()) AS live_mandates,
+                          (SELECT count(*) FROM agent_keys k WHERE k.agent_id = a.id AND k.revoked_at IS NULL) AS keys
                    FROM agents a LEFT JOIN agent_projects ap ON ap.agent_id = a.id
                    GROUP BY a.id ORDER BY a.id""",
             )
@@ -176,7 +178,10 @@ class AdminApi:
             return await fetchall(
                 conn,
                 f"""SELECT id, parent_id, issuer_kind, issuer, holder, scope, limits, delegations_left, depth,
-                           expires_at, revoked_at, created_at,
+                           expires_at, revoked_at, created_at, format, exported_as, external_id, issuer_principal,
+                           EXISTS (SELECT 1 FROM credential_links l JOIN credential_revocations r
+                                     ON r.external_id = l.external_id AND r.format = l.format
+                                   WHERE l.mandate_id = m.id) AS revocation_published,
                            (SELECT coalesce(jsonb_object_agg(limit_key, used), '{{}}') FROM limit_usage u
                              WHERE u.mandate_id = m.id) AS usage,
                            (SELECT jsonb_build_object('id', t.id, 'title', t.title, 'status', t.status) FROM tasks t
@@ -185,6 +190,36 @@ class AdminApi:
                     {"" if include_dead else "WHERE revoked_at IS NULL AND expires_at > now()"}
                     ORDER BY depth, created_at""",
             )
+
+    async def credentials_status(self, _r: Request, _h: str) -> Any:
+        """Each registered format's published revocation list (version, ids on it now, where it is
+        served) and the format handed to agents on claim."""
+        formats = credentials.names()
+        async with transaction(self.pool) as conn:
+            versions = {
+                r["format"]: r["version"]
+                for r in await fetchall(conn, "SELECT format, version FROM credential_revocation_version")
+            }
+            counts = {
+                r["format"]: r["n"]
+                for r in await fetchall(
+                    conn,
+                    """SELECT format, count(*) AS n FROM credential_revocations
+                       WHERE expires_at IS NULL OR expires_at > now() GROUP BY format""",
+                )
+            }
+        return {
+            "export_format": export_format(),
+            "formats": [
+                {
+                    "format": f,
+                    "version": int(versions.get(f, 0)),
+                    "revoked_count": int(counts.get(f, 0)),
+                    "published_path": credentials.SRL_PREFIX + f,
+                }
+                for f in formats
+            ],
+        }
 
     async def mandate_impact(self, request: Request, _h: str) -> Any:
         return await self.admin.revoke_mandate_impact(request.path_params["mandate_id"])
@@ -477,6 +512,7 @@ def build_admin_app(pool: AsyncConnectionPool[Conn], verifier: Verifier) -> Star
             Route(f"{p}/agents/{{agent_id}}/keys/{{kid}}", r(a.revoke_agent_key), methods=["DELETE"]),
             Route(f"{p}/agents/{{agent_id}}/credentials", r(a.import_credential), methods=["POST"]),
             Route(f"{p}/trusted-roots", r(a.trusted_roots)),
+            Route(f"{p}/credentials/status", r(a.credentials_status)),
             Route(f"{p}/trusted-roots", r(a.add_trusted_root), methods=["POST"]),
             Route(f"{p}/trusted-roots/{{principal}}", r(a.revoke_trusted_root), methods=["DELETE"]),
             Route(f"{p}/mandates", r(a.mandates)),

@@ -370,3 +370,81 @@ async def test_people_change_an_agents_permissions_by_replacing_its_root(
     assert r.json()["error"] == "project_mismatch"
     vic = admin_token(issuer, settings, who="vic")
     assert (await api(url, "POST", f"/mandates/{new}/replace", vic, {"scope": wider})).status_code == 403
+
+
+async def test_mandates_show_their_credential_and_whether_its_revocation_is_published(
+    world: World, board: tuple[str, ResourceSettings], issuer: Issuer
+) -> None:
+    from pact.db import transaction
+
+    url, settings = board
+    await people(world)
+    boss = admin_token(issuer, settings)
+    root = world.roots["code-web"]
+    async with transaction(world.pool) as conn:
+        await conn.execute("UPDATE mandates SET exported_as = 'tenuo', external_id = 'w-leaf' WHERE id = %s", (root,))
+        await conn.execute(
+            "INSERT INTO credential_links (mandate_id, format, external_id) VALUES (%s, 'tenuo', 'w-leaf')", (root,)
+        )
+    mandates = {m["id"]: m for m in (await api(url, "GET", "/mandates", boss)).json()}
+    m = mandates[root]
+    assert (m["format"], m["exported_as"], m["external_id"], m["issuer_principal"]) == ("pact", "tenuo", "w-leaf", None)
+    assert m["revocation_published"] is False
+    assert mandates[world.roots["chat-boss"]]["revocation_published"] is False
+
+    assert (await api(url, "POST", f"/mandates/{root}/revoke", boss)).status_code == 200
+    dead = {m["id"]: m for m in (await api(url, "GET", "/mandates?all=1", boss)).json()}
+    assert dead[root]["revocation_published"] is True
+    assert dead[world.roots["chat-boss"]]["revocation_published"] is False
+
+
+async def test_credentials_status_reports_each_formats_revocation_list(
+    world: World, board: tuple[str, ResourceSettings], issuer: Issuer, monkeypatch: Any
+) -> None:
+    from pact.db import transaction
+
+    url, settings = board
+    await people(world)
+    vic = admin_token(issuer, settings, who="vic")  # any role may read it
+    monkeypatch.delenv("PACT_EXPORT_FORMAT", raising=False)
+    before = (await api(url, "GET", "/credentials/status", vic)).json()
+    assert before["export_format"] is None
+    assert {f["format"]: f for f in before["formats"]}["tenuo"] == {
+        "format": "tenuo",
+        "version": 0,
+        "revoked_count": 0,
+        "published_path": "/.well-known/pact-revocations/tenuo",
+    }
+
+    root = world.roots["code-web"]
+    async with transaction(world.pool) as conn:
+        await conn.execute(
+            "INSERT INTO credential_links (mandate_id, format, external_id) VALUES (%s, 'tenuo', 'w1'), (%s, 'tenuo', 'w2')",
+            (root, root),
+        )
+    await world.admin.revoke_mandate(root, by="boss")
+    monkeypatch.setenv("PACT_EXPORT_FORMAT", "tenuo")
+    after = (await api(url, "GET", "/credentials/status", vic)).json()
+    assert after["export_format"] == "tenuo"
+    by_format = {f["format"]: f for f in after["formats"]}
+    assert (by_format["tenuo"]["version"], by_format["tenuo"]["revoked_count"]) == (1, 2)
+    assert (by_format["biscuit"]["version"], by_format["biscuit"]["revoked_count"]) == (0, 0)
+
+
+async def test_agents_show_how_many_live_keys_they_hold(
+    world: World, board: tuple[str, ResourceSettings], issuer: Issuer
+) -> None:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from pact.keys import b64url, public_bytes
+
+    url, settings = board
+    await people(world)
+    boss = admin_token(issuer, settings)
+    keys = [b64url(public_bytes(Ed25519PrivateKey.generate().public_key())) for _ in range(2)]
+    for k in keys:
+        assert (await api(url, "POST", "/agents/code-web/keys", boss, {"public_key": k})).status_code == 200
+    listed = (await api(url, "GET", "/agents/code-web/keys", boss)).json()
+    await api(url, "DELETE", f"/agents/code-web/keys/{listed[0]['kid']}", boss)
+    agents = {a["id"]: a for a in (await api(url, "GET", "/agents", boss)).json()}
+    assert agents["code-web"]["keys"] == 1 and agents["chat-boss"]["keys"] == 0

@@ -268,7 +268,7 @@ def admin_api_on_board() -> bool:
 
 _HOOK_PATH = re.compile(r"^/hooks/a/([a-z0-9][a-z0-9-]{0,62})/([a-z-]+)$")
 KEYS_PATH = "/.well-known/pact-keys.json"
-SRL_PREFIX = "/.well-known/pact-revocations/"
+SRL_PREFIX = credentials.SRL_PREFIX
 SRL_PATH = SRL_PREFIX + "tenuo"
 """Tenuo's list; every registered format has one at ``SRL_PREFIX + <format>``."""
 SRL_VERSION_HEADER = b"x-pact-revocations-version"

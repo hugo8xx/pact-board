@@ -199,6 +199,13 @@ Before revoking, `GET /admin/api/mandates/{id}/impact` shows what would go with 
 open tasks that get canceled, agents that lose authority) without changing anything. Resuming a
 deferred task takes an optional `answer`, which the agent then sees on the task in `pact_list`.
 
+For the credential views, `GET /admin/api/mandates` also returns each mandate's `format`,
+`exported_as`, `external_id`, `issuer_principal` and `revocation_published` (some id minted for it
+is on a published revocation list); `GET /admin/api/agents` returns each agent's live `keys`; and
+`GET /admin/api/credentials/status` gives, per format, the revocation list's `version`, the
+`revoked_count` of ids on it now and its `published_path`, plus the current `export_format`
+(`PACT_EXPORT_FORMAT`, or null).
+
 Mandates are signed and never edited. To change an agent's permissions, `POST
 /admin/api/mandates/{id}/replace` with the new `scope` issues a fresh root mandate and makes it the
 agent's own. With `"revoke": true` the old root and everything delegated under it go too; without
