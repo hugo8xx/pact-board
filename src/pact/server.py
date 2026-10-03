@@ -129,7 +129,10 @@ def build_mcp(board: Board) -> MCPServer:
     async def pact_list(
         ctx: Context,
         mandate_id: MandateId,
-        filter: Annotated[ListFilter, Field(description="open: unclaimed work you may take · mine: yours · all.")] = "open",
+        filter: Annotated[
+            ListFilter,
+            Field(description="open: unclaimed work you may take · mine: yours, still open · done: yours, closed · all."),
+        ] = "open",
         project_id: str | None = None,
         since: Annotated[
             int | None, Field(description="next_since from your previous call; returns only what changed after it.")
