@@ -87,6 +87,9 @@ class CredentialFormat(Protocol):
         ...
 
 
+SRL_PREFIX = "/.well-known/pact-revocations/"
+"""Where the board publishes each format's signed revocation list: ``SRL_PREFIX + <format>``."""
+
 _FORMATS: dict[str, CredentialFormat] = {}
 _BUILTIN = ("biscuit", "tenuo")
 """Formats shipped with the board, loaded the first time they are asked for."""
