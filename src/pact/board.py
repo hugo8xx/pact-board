@@ -89,7 +89,7 @@ async def _export_on_claim(conn: Conn, chain: Chain, fmt_name: str) -> dict[str,
         "credential": {
             "format": exported.format,
             "external_id": exported.external_id,
-            "warrant_stack": exported.credential.decode(),
+            exported.field: exported.credential.decode(),
         }
     }
 
