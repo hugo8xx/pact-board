@@ -110,8 +110,11 @@ async def test_a_credential_exported_on_claim_verifies_offline_and_matches_the_l
         row = await fetchone(conn, "SELECT exported_as, external_id FROM mandates WHERE id = %s", (out["mandate_id"],))
     assert mandate is not None and row == {"exported_as": "tenuo", "external_id": cred["external_id"]}
     assert set(stack[-1].tools) == {"task.work", "task.read"}
-    leaf_exp = datetime.fromisoformat(stack[-1].expires_at())
-    assert abs((leaf_exp - mandate.expires_at).total_seconds()) < 5
+    link_exp = datetime.fromisoformat(stack[-2].expires_at())  # the board-held warrant for the ledger link
+    assert abs((link_exp - mandate.expires_at).total_seconds()) < 5
+    leaf_exp = datetime.fromisoformat(stack[-1].expires_at())  # the agent's leaf: the link's expiry, at most a day
+    expected = min(mandate.expires_at, datetime.now(UTC) + timedelta(hours=24))
+    assert abs((leaf_exp - expected).total_seconds()) < 5
     assert stack[-1].is_terminal() is False  # the delegated link may still delegate once
 
     v = verifier()
@@ -412,3 +415,16 @@ def test_warrants_round_trip_from_the_published_stack() -> None:
     w = Warrant.mint_builder().capability("task.work", **capabilities(["task.work@project:web"], {})["task.work"])
     root = w.holder(board.public_key).ttl(60).mint(board)
     assert TenuoFormat().revocation_ids(encode_warrant_stack([root]).encode()) == [root.id]
+
+
+async def test_an_agents_credential_is_short_even_when_its_mandate_is_long(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A root mandate runs for weeks and is not revoked when a task closes; the leaf an agent holds is re-issued per claim."""
+    keys = await setup(world)
+    t = await world.board.post(world.agents["chat-boss"], project_id="web", title="x", mandate_id=world.roots["chat-boss"])
+    monkeypatch.setenv("PACT_EXPORT_TTL_HOURS", "2")
+    out = await world.board.claim(world.agents["code-web"], task_id=t["task_id"], mandate_id=world.roots["code-web"])
+    stack = decode_warrant_stack_base64(out["credential"]["warrant_stack"])
+    leaf_exp = datetime.fromisoformat(stack[-1].expires_at())
+    assert leaf_exp <= datetime.now(UTC) + timedelta(hours=2, seconds=5)
+    assert datetime.fromisoformat(stack[0].expires_at()) > datetime.now(UTC) + timedelta(days=20)  # the root link is untouched
+    assert allowed(verifier(), out["credential"], keys["code-web"])

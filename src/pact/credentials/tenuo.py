@@ -20,6 +20,7 @@ Mapping per link:
 - TTL = seconds until the link expires, at most Tenuo's 90 days; a child never outlives its parent.
 """
 
+import os
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -104,6 +105,13 @@ def ttl(expires_at: datetime, now: datetime) -> int:
     return max(1, min(int(MAX_WARRANT_TTL_SECS), int((expires_at - now).total_seconds())))
 
 
+def leaf_ttl_cap() -> int:
+    """``PACT_EXPORT_TTL_HOURS`` (default 24): the longest an exported leaf lives. A root mandate
+    can run for weeks and is not revoked when a task closes, so an agent's outside credential is
+    kept short and simply re-issued on its next claim."""
+    return max(60, int(float(os.environ.get("PACT_EXPORT_TTL_HOURS", "24")) * 3600))
+
+
 class TenuoFormat:
     name = NAME
 
@@ -133,7 +141,7 @@ class TenuoFormat:
                 warrants[-1],
                 capabilities(leaf.scope, limits[-1]),
                 PublicKey.from_bytes(key),
-                ttl(leaf.expires_at, now),
+                min(ttl(leaf.expires_at, now), leaf_ttl_cap()),
                 board,
                 leaf.delegations_left == 0,
             )

@@ -47,7 +47,8 @@ that has a registered key a credential for the mandate it claimed with:
 outside the board can then check each call offline, trusting only the board's public keys
 (`examples/tenuo_verifier/`). The stack holds one warrant per ledger link, all held and signed by
 the board, then a leaf held by the agent's key, which signs every call (proof of possession); the
-board never sees an agent's private key. `action@project:P` becomes Tenuo tool `action` with
+board never sees an agent's private key. The leaf lives at most `PACT_EXPORT_TTL_HOURS` (default 24)
+and is re-issued on each claim. `action@project:P` becomes Tenuo tool `action` with
 `project` constrained to P; each limit becomes a per-call ceiling (every call must pass every
 limit key); `task_id` is the one free argument; the TTL follows the link's expiry, at most 90 days.
 When no credential can be issued (no key, or a wildcard scope such as `task.*`) the claim still
