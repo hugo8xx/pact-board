@@ -35,6 +35,9 @@ class Exported:
     links: tuple[tuple[str, str], ...] = ()
     """(mandate id, external id) for every piece of the credential, so revoking any ledger link
     finds what was minted for it. Empty when the credential has one id (``external_id``)."""
+    field: str = "warrant_stack"
+    """The key under which ``pact_claim`` hands the agent ``credential`` as text. Tenuo's
+    ``warrant_stack`` came first and stays the default; other formats name their own."""
 
 
 @dataclass(frozen=True)
@@ -78,12 +81,14 @@ class CredentialFormat(Protocol):
         ...
 
     def revocation_list(self, revoked: Sequence[str], *, keyring: Keyring, version: int) -> bytes:
-        """A signed list of revoked ids for outside verifiers. ``version`` only ever grows."""
+        """A signed list of revoked ids for outside verifiers. ``version`` only ever grows. A format
+        may set ``revocation_list_type`` to the media type it is served as (default
+        ``application/octet-stream``)."""
         ...
 
 
 _FORMATS: dict[str, CredentialFormat] = {}
-_BUILTIN = ("tenuo",)
+_BUILTIN = ("biscuit", "tenuo")
 """Formats shipped with the board, loaded the first time they are asked for."""
 
 
@@ -91,10 +96,15 @@ def _builtin(name: str) -> CredentialFormat | None:
     if name == "tenuo":
         from .tenuo import TenuoFormat
 
-        fmt = TenuoFormat()
-        register(fmt)
-        return fmt
-    return None
+        fmt: CredentialFormat = TenuoFormat()
+    elif name == "biscuit":
+        from .biscuit import BiscuitFormat
+
+        fmt = BiscuitFormat()
+    else:
+        return None
+    register(fmt)
+    return fmt
 
 
 def register(fmt: CredentialFormat) -> None:

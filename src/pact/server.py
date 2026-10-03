@@ -268,7 +268,9 @@ def admin_api_on_board() -> bool:
 
 _HOOK_PATH = re.compile(r"^/hooks/a/([a-z0-9][a-z0-9-]{0,62})/([a-z-]+)$")
 KEYS_PATH = "/.well-known/pact-keys.json"
-SRL_PATH = "/.well-known/pact-revocations/tenuo"
+SRL_PREFIX = "/.well-known/pact-revocations/"
+SRL_PATH = SRL_PREFIX + "tenuo"
+"""Tenuo's list; every registered format has one at ``SRL_PREFIX + <format>``."""
 SRL_VERSION_HEADER = b"x-pact-revocations-version"
 _METADATA_PATH = re.compile(r"^/\.well-known/oauth-protected-resource/mcp/a/([a-z0-9][a-z0-9-]{0,62})/?$")
 
@@ -305,8 +307,12 @@ class PactApp:
             # Public keys only: anyone may verify what the board signed.
             await _respond(send, 200, keyring().jwks(), extra_headers=[(b"access-control-allow-origin", b"*")])
             return
-        if path == SRL_PATH:
-            await self._revocations(send, "tenuo")
+        if path.startswith(SRL_PREFIX):
+            fmt_name = path[len(SRL_PREFIX) :]
+            if fmt_name not in credentials.names():
+                await _respond(send, 404, {"error": "not_found", "message": f"no revocation list for format {fmt_name!r}"})
+                return
+            await self._revocations(send, fmt_name)
             return
         if path.startswith("/admin/api/"):
             if not admin_api_on_board():
@@ -365,12 +371,14 @@ class PactApp:
 
     async def _revocations(self, send: Send, fmt_name: str) -> None:
         """The signed list of outside credential ids revoked on the board. Public, like the keys:
-        it names only warrant ids. Built fresh on each request so a revoke shows up at once."""
+        it names only credential ids. Built fresh on each request so a revoke shows up at once."""
         async with transaction(self.pool) as conn:
             revoked, version = await credentials.revocation_state(conn, fmt_name)
-        body = credentials.get(fmt_name).revocation_list(revoked, keyring=keyring(), version=version)
+        fmt = credentials.get(fmt_name)
+        body = fmt.revocation_list(revoked, keyring=keyring(), version=version)
+        content_type = getattr(fmt, "revocation_list_type", "application/octet-stream")
         headers = [
-            (b"content-type", b"application/octet-stream"),
+            (b"content-type", content_type.encode()),
             (b"content-length", str(len(body)).encode()),
             (b"cache-control", b"no-store"),
             (b"access-control-allow-origin", b"*"),

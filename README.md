@@ -38,7 +38,7 @@ keys at `/.well-known/pact-keys.json`, so a verifier elsewhere can check what th
 rotate, put a new `PACT_BOARD_KEYS` entry first and keep the old one until the mandates it signed have
 expired. Mandates signed before Ed25519 (an HMAC under `PACT_SIGNING_KEY`) keep verifying. The ledger
 stays the source of truth; `pact.credentials` is the interface that exports it as, or imports it from,
-standard delegation credentials (Tenuo first, then Biscuit). Agents that hold exported credentials
+standard delegation credentials (Tenuo or Biscuit, by `PACT_EXPORT_FORMAT`). Agents that hold exported credentials
 register an Ed25519 public key (`pact-admin agent-key-add`, code and runner agents only).
 
 **Exported credentials (Tenuo).** With `PACT_EXPORT_FORMAT=tenuo`, `pact_claim` also hands an agent
@@ -56,10 +56,39 @@ succeeds and says why in `credential_note`. Unset, claims are unchanged. The led
 source of truth: cumulative limits, DEFER and approvals are enforced only by the board.
 
 Revoking a mandate on the board (`pact_revoke`, the Admin, closing or reassigning a task) puts every
-warrant minted for it and for everything under it on a signed revocation list, published at
-`GET /.well-known/pact-revocations/tenuo` (`application/octet-stream`, version in
-`x-pact-revocations-version`). Verifiers must refetch it at least every 60 seconds and must fail
+credential id minted for it and for everything under it on a signed revocation list, one per format,
+published at `GET /.well-known/pact-revocations/<format>` (version in `x-pact-revocations-version`;
+an unknown format is a 404). For Tenuo that is `/.well-known/pact-revocations/tenuo`, a Tenuo SRL
+(`application/octet-stream`). Verifiers must refetch it at least every 60 seconds and must fail
 closed, refusing every call, when they cannot.
+
+**Exported credentials (Biscuit).** `PACT_EXPORT_FORMAT=biscuit` swaps the format and nothing else:
+the claim carries `"credential": {"format": "biscuit", "external_id": …, "biscuit": <base64url token>}`.
+The token has one block per ledger link: the authority block for the root link, signed with the
+board's active key (its Biscuit root key id is the first 4 bytes of SHA-256 of the public key, so a
+verifier picks the right JWKS key after a rotation), then one attenuation block per later link. Each
+block holds Datalog checks for its link's scope (`tool(a), project(p)`), per-call limits
+(`arg(k, $v), $v <= max`, in millionths because Biscuit has integers only) and expiry; the last
+block also carries `holder("<agent key>")` and refuses arguments nobody constrained. A verifier adds
+`tool(…)`, `project(…)`, `arg(…)` and `time(…)` facts (`pact.credentials.biscuit.authorizer_for`).
+Every block has a revocation id and a token's ids include its parents', so revoking any link fails
+every token minted through it. Biscuit has no revocation list format, so the board publishes JSON
+at `/.well-known/pact-revocations/biscuit` (`application/json`):
+`{"payload": "<canonical JSON>", "signature": "ed25519:<kid>:<base64url>"}`, where the payload is
+`{"format":"biscuit","issued_at":…,"revoked":[<hex ids>],"version":n}` (sorted keys, no spaces) and
+the signature is over its UTF-8 bytes with the JWKS key named by `kid`
+(`pact.credentials.biscuit.verify_revocation_list`). Importing Biscuit tokens is not supported yet.
+
+| | Tenuo | Biscuit |
+| --- | --- | --- |
+| Proof of possession | yes: the agent signs every call with its key | **no**: a bearer token; whoever has it can use it until it expires or is revoked |
+| Holder binding | leaf warrant held by the agent's key | `holder(…)` fact, informational only |
+| Revocation list | Tenuo SRL, board-signed | board-signed JSON (above) |
+| A later link widening | refused by Tenuo | not an error, but ineffective: only the authority block's `right` facts grant |
+| Shape | one board-held warrant per link + the agent's leaf | one block per link |
+
+Pick Tenuo where a leaked credential must be useless to someone else; Biscuit only where the
+verifier authenticates its caller some other way.
 
 **Imported credentials (Tenuo).** An organization that issues its own Tenuo warrants can give one
 to a PACT agent, and the board turns it into a root mandate. First an owner registers the
@@ -190,6 +219,8 @@ it, work already delegated under the old one carries on until it expires.
 | `PACT_ADMIN_API` | no | default `on`; `off` makes the board stop serving `/admin/api` once the Admin API service is live |
 | `PACT_SLACK_WEBHOOK_URL` | no | a Slack incoming webhook; the process that has it delivers notifications (set it on the Admin API service only) |
 | `PACT_ADMIN_UI_URL` | no | the Admin UI's URL, so a notification links to its task, e.g. `https://admin.example.com` |
+| `PACT_EXPORT_FORMAT` | no | `tenuo` or `biscuit`: hand agents with a registered key an outside credential on claim; unset = none |
+| `PACT_EXPORT_TTL_HOURS` | no | default `24`; the longest an exported credential an agent holds lives |
 | `PORT`, `HOST` | no | default `8787`, `127.0.0.1` (`0.0.0.0` in the container) |
 
 ## Deploy on Railway
@@ -228,6 +259,7 @@ The test suite drops and recreates the `public` schema of the test database on e
 | `src/pact/admin_server.py` | the Admin API as its own service (`pact-admin-api`) |
 | `src/pact/oauth.py` | the board as an OAuth protected resource (RFC 9728, JWKS verification) |
 | `src/pact/server.py` | MCP tools, `/mcp/a/<agent>` routing, agent-token and OAuth auth |
+| `src/pact/credentials/` | credential adapters (`tenuo.py`, `biscuit.py`); `tests/test_credential_conformance.py` runs every format |
 | `src/pact/hooks.py` | the Claude Code hook endpoints |
 | `hooks/` | the hook script and a settings example |
 | `src/pact/migrations/` | SQL schema |
