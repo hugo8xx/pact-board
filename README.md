@@ -108,7 +108,9 @@ Mapping is the export's in reverse: tool `T` with `project` `Exact(P)` or `OneOf
 be `Wildcard`. Anything else is refused with `invalid_request` rather than dropped, since dropping
 a constraint would widen what the issuer granted: a tool without `project`, a wildcard tool name,
 other constraint types (`Pattern`, `Range` with a minimum, …), other arguments, outside approvals.
-Revoking the trusted root stops every mandate imported under it (`mandate_revoked`); an agent's
+Revoking the trusted root stops every mandate imported under it (`mandate_revoked`). A revoked key
+can be added again (`trusted-root-add` with the same key reactivates it), but only from then on:
+mandates imported before the revoke stay dead and must be imported anew. An agent's
 `pact_revoke` of an imported root gets `not_issuer`, and people revoke it like any root mandate.
 
 **Handoff.** `pact_report` with `completed`, `failed` or `canceled` must carry a handoff in `result`:

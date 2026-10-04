@@ -359,7 +359,8 @@ async def verify_chain(conn: Conn, leaf_id: str, holder: str, now: datetime | No
 
 async def _check_trusted_roots(conn: Conn, links: list[Mandate]) -> None:
     """A link imported from an outside credential lives only while its issuing key is still a
-    trusted root standing for the human the link names as issuer."""
+    trusted root standing for the human the link names as issuer, and only if it was imported
+    during the key's current activation: re-adding a revoked key never revives what came before."""
     imported = [m for m in links if m.format != "pact" and m.issuer_principal]
     if not imported:
         return
@@ -370,15 +371,17 @@ async def _check_trusted_roots(conn: Conn, links: list[Mandate]) -> None:
         except ValueError:
             raise PactError("chain_broken", f"mandate {m.id} names an unreadable issuer key", m.id) from None
     live = {
-        (b64url(bytes(r["principal"])), r["human"])
+        (r["mandate_id"], b64url(bytes(r["principal"])), r["human"])
         for r in await fetchall(
             conn,
-            "SELECT principal, human FROM trusted_roots WHERE principal = ANY(%s) AND revoked_at IS NULL",
-            (principals,),
+            """SELECT m.id::text AS mandate_id, r.principal, r.human
+               FROM trusted_roots r JOIN mandates m ON m.id = ANY(%s::uuid[]) AND m.created_at >= r.active_since
+               WHERE r.principal = ANY(%s) AND r.revoked_at IS NULL""",
+            ([m.id for m in imported], principals),
         )
     }
     for m in imported:
-        if (m.issuer_principal, m.issuer) not in live:
+        if (m.id, m.issuer_principal, m.issuer) not in live:
             raise PactError(
                 "mandate_revoked", f"mandate {m.id} was imported under key {m.issuer_principal}, no longer a trusted root", m.id
             )
