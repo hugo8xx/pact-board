@@ -26,7 +26,6 @@ tool), ``task_id`` may only be ``Wildcard``. Anything the ledger cannot hold is 
 dropped, because dropping a constraint would widen the authority the issuer granted.
 """
 
-import os
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -49,9 +48,10 @@ from tenuo import (
 
 from ..errors import PactError
 from ..keys import Keyring, b64url, b64url_decode, public_bytes
-from ..mandates import Chain, Limits, Mandate
+from ..mandates import Chain, Limits
 from ..scope import parse_board_scope
 from . import Exported, Imported, TrustedRoot
+from .shapes import effective_limits, leaf_ttl_cap, unexportable
 
 NAME = "tenuo"
 FREE_ARGS = ("task_id",)
@@ -76,15 +76,6 @@ def trusted_roots_from_jwks(jwks: Mapping[str, Any]) -> list[PublicKey]:
     return [PublicKey.from_bytes(b64url_decode(k["x"])) for k in jwks.get("keys", []) if k.get("crv") == "Ed25519"]
 
 
-def unexportable(scope: Sequence[str]) -> list[str]:
-    out = []
-    for s in scope:
-        parsed = parse_board_scope(s)
-        if parsed is None or "*" in parsed.action:
-            out.append(s)
-    return out
-
-
 def capabilities(scope: Sequence[str], limits: Limits) -> dict[str, dict[str, Any]]:
     by_action: dict[str, list[str]] = {}
     for s in scope:
@@ -102,25 +93,8 @@ def capabilities(scope: Sequence[str], limits: Limits) -> dict[str, dict[str, An
     return caps
 
 
-def effective_limits(links: Sequence[Mandate]) -> list[Limits]:
-    """Each link's per-call ceilings: its own, tightened by every ancestor's."""
-    out: list[Limits] = []
-    current: Limits = {}
-    for m in links:
-        current = {**current, **{k: min(v, current.get(k, v)) for k, v in m.limits.items()}}
-        out.append(dict(current))
-    return out
-
-
 def ttl(expires_at: datetime, now: datetime) -> int:
     return max(1, min(int(MAX_WARRANT_TTL_SECS), int((expires_at - now).total_seconds())))
-
-
-def leaf_ttl_cap() -> int:
-    """``PACT_EXPORT_TTL_HOURS`` (default 24): the longest an exported leaf lives. A root mandate
-    can run for weeks and is not revoked when a task closes, so an agent's outside credential is
-    kept short and simply re-issued on its next claim."""
-    return max(60, int(float(os.environ.get("PACT_EXPORT_TTL_HOURS", "24")) * 3600))
 
 
 class TenuoFormat:

@@ -265,6 +265,29 @@ async def test_the_example_verifier_accepts_board_credentials_and_follows_revoca
     assert stale.is_error and "stale" in stale.content[0].text
 
 
+async def test_the_example_verifier_accepts_each_signed_call_once(world: World) -> None:
+    """A signature seen once cannot be replayed within Tenuo's acceptance window, even across a refresh."""
+    ex = example()
+    c = await chain_of_three(world)
+    key = c["keys"]["code-web-2"]
+    trust = ex.BoardTrust()
+    trust.load(keyring().jwks(), TenuoFormat().revocation_list([], keyring=keyring(), version=0))
+    server = ex.build_server(trust)
+    args = {"project": "web", "task_id": "T-1"}
+    signed = meta(c["a"]["credential"]["warrant_stack"], key, "task.work", args)
+
+    async with Client(server) as client:
+        first = await client.call_tool("task.work", args, meta=signed)
+        replay = await client.call_tool("task.work", args, meta=signed)
+    assert not first.is_error, first
+    assert replay.is_error, "a replayed signature must be refused"
+
+    trust.load(keyring().jwks(), TenuoFormat().revocation_list([], keyring=keyring(), version=1))  # a refresh
+    async with Client(server) as client:
+        again = await client.call_tool("task.work", args, meta=signed)
+    assert again.is_error, "a refresh must not forget used signatures"
+
+
 def test_warrants_round_trip_from_the_published_stack() -> None:
     board = SigningKey.generate()
     w = Warrant.mint_builder().capability("task.work", **capabilities(["task.work@project:web"], {})["task.work"])

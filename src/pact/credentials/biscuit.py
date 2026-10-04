@@ -64,7 +64,7 @@ from ..keys import PREFIX, Keyring, b64url, b64url_decode, public_bytes
 from ..mandates import Chain, Limits
 from ..scope import parse_board_scope
 from . import Exported, Imported, TrustedRoot
-from .tenuo import effective_limits, leaf_ttl_cap, unexportable
+from .shapes import effective_limits, leaf_ttl_cap, unexportable
 
 NAME = "biscuit"
 MICRO = 1_000_000

@@ -5,6 +5,12 @@ revocation list (``/.well-known/pact-revocations/tenuo``), refetched every 30 se
 is older than 60 seconds, because the board cannot be reached, every call is refused: a verifier
 that kept going on an old list would honor credentials the board has already revoked.
 
+Each proof-of-possession signature is accepted once. Tenuo accepts a signature for a short window
+(30 s × 5 by default), so without a nonce store anyone who saw one call could replay it within that
+window. The store outlives every refresh of the keys and the list, so a refresh never forgets what
+was already used. It lives in this process; several workers need a shared backend (see
+``tenuo.nonce.NonceStore``).
+
     uv run python examples/tenuo_verifier/server.py https://board.example.com
 
 Each call carries ``params._meta.tenuo = {"warrant": <warrant_stack>, "signature": <b64 PoP>}``;
@@ -22,11 +28,14 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from tenuo import Authorizer, PublicKey, SignedRevocationList
 from tenuo.mcp import MCPVerifier
+from tenuo.nonce import NonceStore
 
 from pact.keys import b64url_decode
 
 REFRESH_SECONDS = 30
 MAX_AGE_SECONDS = 60
+NONCE_TTL_SECONDS = 150
+"""How long a used signature is remembered: longer than Tenuo's acceptance window (30 s × 5)."""
 
 
 class BoardTrust:
@@ -37,6 +46,7 @@ class BoardTrust:
         self.version = -1
         self.loaded_at: float | None = None
         self._verifier: MCPVerifier | None = None
+        self.nonces = NonceStore(ttl_seconds=NONCE_TTL_SECONDS)
 
     def load(self, jwks: Mapping[str, Any], srl: bytes, now: float | None = None) -> None:
         """Install the board's keys and revocation list. An older list than the one held is
@@ -49,7 +59,7 @@ class BoardTrust:
             return
         authorizer = Authorizer(trusted_roots=roots)
         authorizer.set_revocation_list(revocations)  # checks the list is signed by a trusted root
-        self._verifier = MCPVerifier(authorizer=authorizer)
+        self._verifier = MCPVerifier(authorizer=authorizer, nonce_store=self.nonces)
         self.version = revocations.version
         self.loaded_at = time.monotonic() if now is None else now
 
