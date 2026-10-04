@@ -242,7 +242,11 @@ class Admin:
     async def add_trusted_root(self, public_key: str, *, human: str, by: str, label: str | None = None) -> dict[str, Any]:
         """Trust an outside Ed25519 key (base64url of its raw 32 bytes) to issue credentials on
         behalf of ``human``. Owners only: a trusted root can grant agents authority in that
-        person's name, so adding one is as weighty as adding the person."""
+        person's name, so adding one is as weighty as adding the person.
+
+        A key that was revoked can be trusted again (a mistaken or temporary revoke should not
+        force the organization to rotate its key), but only from now on: mandates imported under
+        it before stay dead, since they were imported before this activation."""
         try:
             raw = public_key_from_text(public_key)
         except ValueError as err:
@@ -251,14 +255,24 @@ class Admin:
             await self._require(conn, by, "owner")
             if await fetchone(conn, "SELECT 1 FROM humans WHERE id = %s", (human,)) is None:
                 raise PactError("not_found", f"{human} is not a registered human")
-            if await fetchone(conn, "SELECT 1 FROM trusted_roots WHERE principal = %s", (raw,)):
-                raise PactError("invalid_request", "this key is already a trusted root (a revoked one cannot come back)")
-            await conn.execute(
-                "INSERT INTO trusted_roots (principal, human, label, created_by) VALUES (%s, %s, %s, %s)", (raw, human, label, by)
-            )
+            existing = await fetchone(conn, "SELECT revoked_at FROM trusted_roots WHERE principal = %s FOR UPDATE", (raw,))
             principal = b64url(raw)
-            await self._log(conn, by, "admin.trusted_root.add", {"principal": principal, "human": human, "label": label})
-        return {"principal": principal, "human": human, "label": label}
+            if existing is not None and existing["revoked_at"] is None:
+                raise PactError("invalid_request", "this key is already a trusted root")
+            if existing is None:
+                await conn.execute(
+                    "INSERT INTO trusted_roots (principal, human, label, created_by) VALUES (%s, %s, %s, %s)",
+                    (raw, human, label, by),
+                )
+            else:
+                await conn.execute(
+                    """UPDATE trusted_roots SET human = %s, label = %s, revoked_at = NULL, active_since = now()
+                       WHERE principal = %s""",
+                    (human, label, raw),
+                )
+            action = "admin.trusted_root.add" if existing is None else "admin.trusted_root.reactivate"
+            await self._log(conn, by, action, {"principal": principal, "human": human, "label": label})
+        return {"principal": principal, "human": human, "label": label, "reactivated": existing is not None}
 
     async def revoke_trusted_root(self, principal: str, *, by: str) -> int:
         """Stop trusting a key. Every mandate imported under it fails its chain check from now on."""
@@ -280,7 +294,8 @@ class Admin:
         async with transaction(self.pool) as conn:
             rows = await fetchall(
                 conn,
-                "SELECT principal, human, label, created_by, created_at, revoked_at FROM trusted_roots ORDER BY created_at",
+                """SELECT principal, human, label, created_by, created_at, active_since, revoked_at
+                   FROM trusted_roots ORDER BY created_at""",
             )
         return [{**r, "principal": b64url(bytes(r["principal"]))} for r in rows]
 

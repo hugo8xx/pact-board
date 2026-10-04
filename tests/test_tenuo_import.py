@@ -73,7 +73,7 @@ async def test_only_owners_manage_trusted_roots_and_each_stands_for_a_registered
     assert (await refused(world.admin.add_trusted_root(key_text(org), human="nobody", by="boss"))).code == "not_found"
     assert (await refused(world.admin.add_trusted_root("not-a-key", human="boss", by="boss"))).code == "invalid_request"
     out = await world.admin.add_trusted_root(key_text(org), human="ann", by="boss", label="Acme")
-    assert out == {"principal": key_text(org), "human": "ann", "label": "Acme"}
+    assert out == {"principal": key_text(org), "human": "ann", "label": "Acme", "reactivated": False}
     assert (await refused(world.admin.add_trusted_root(key_text(org), human="ann", by="boss"))).code == "invalid_request"
     assert (await refused(world.admin.revoke_trusted_root(key_text(org), by="ann"))).code == "forbidden"
     assert await world.admin.revoke_trusted_root(key_text(org), by="boss") == 1
@@ -189,6 +189,31 @@ async def test_revoking_the_trusted_root_stops_mandates_imported_under_it(world:
     assert err.code == "mandate_revoked" and err.mandate_id == mandate_id
     # The agent's own board-issued root is untouched.
     await world.board.list_tasks(world.agents["code-web"], mandate_id=world.roots["code-web"])
+
+
+async def test_a_revoked_root_can_be_trusted_again_but_old_imports_stay_dead(world: World) -> None:
+    """Re-adding a key is a new activation: what was imported before the revoke never comes back."""
+    keys = await setup(world)
+    old = await world.admin.import_credential("code-web", "tenuo", stack(warrant(keys["org"], keys["code-web"])), by="boss")
+    await world.admin.revoke_trusted_root(key_text(keys["org"]), by="boss")
+
+    again = await world.admin.add_trusted_root(key_text(keys["org"]), human="boss", by="boss", label="Acme again")
+    assert again["reactivated"] is True
+    err = await refused(world.board.list_tasks(world.agents["code-web"], mandate_id=old))
+    assert err.code == "mandate_revoked" and err.mandate_id == old
+
+    fresh = await world.admin.import_credential("code-web", "tenuo", stack(warrant(keys["org"], keys["code-web"])), by="boss")
+    await world.board.list_tasks(world.agents["code-web"], mandate_id=fresh)
+
+    # A live key cannot be added twice, and every activation is in the audit log.
+    assert (await refused(world.admin.add_trusted_root(key_text(keys["org"]), human="boss", by="boss"))).code == "invalid_request"
+    [row] = await world.admin.list_trusted_roots()
+    assert row["revoked_at"] is None and row["label"] == "Acme again" and row["active_since"] > row["created_at"]
+    async with transaction(world.pool) as conn:
+        actions = [
+            r["action"] for r in await fetchall(conn, "SELECT action FROM entries WHERE action LIKE 'admin.trusted_root%'")
+        ]
+    assert actions == ["admin.trusted_root.add", "admin.trusted_root.revoke", "admin.trusted_root.reactivate"]
 
 
 async def test_the_issuing_key_is_signed_into_the_row(world: World) -> None:
