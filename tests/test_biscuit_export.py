@@ -158,3 +158,16 @@ def test_the_revocation_document_is_canonical_signed_json() -> None:
         verify_revocation_list(tampered, keyring().jwks())
     with pytest.raises(ValueError, match="unknown key"):
         verify_revocation_list(doc, {"keys": []})
+
+
+def test_loading_biscuit_does_not_load_tenuo() -> None:
+    """Formats share only pact.credentials.shapes, so a deployment picks one without carrying the other."""
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys, pact.credentials.biscuit; "
+        "print(any(m == 'tenuo' or m.startswith('tenuo.') or m == 'pact.credentials.tenuo' for m in sys.modules))"
+    )
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "False"

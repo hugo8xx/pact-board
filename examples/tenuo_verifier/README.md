@@ -44,3 +44,11 @@ Sign `argument_json(args)`, Tenuo's canonical text of the arguments (an integral
 `5.0` is written `5`), not the dict itself, or the proof will not match. Every argument the tool
 receives must be in the warrant: unknown arguments are refused, and so is a call that leaves out a
 constrained one.
+
+## Replays
+
+Tenuo accepts a proof-of-possession signature for a short window (30 s × 5 by default). The demo
+gives its verifier a `tenuo.nonce.NonceStore`, so each signature is accepted once and a replay
+inside that window is refused. The store survives refreshes of the keys and revocation list. It is
+in-process: run several workers and they need a shared backend (for example Redis), or a replay
+can land on another worker. An agent that repeats a call must sign it again.
