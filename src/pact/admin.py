@@ -5,9 +5,13 @@ Agents never reach this module: nothing here is exposed over MCP.
 
 import hashlib
 import json
+import os
+import re
+import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+import psycopg
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
@@ -21,7 +25,7 @@ from .board import (
     get_agent,
     revoke_closed_task_mandates,
 )
-from .crypto import new_token, sha256
+from .crypto import iso, new_token, sha256
 from .db import Conn, fetchall, fetchone, transaction
 from .entries import SYSTEM_CHAIN, EntryInput, append_entry, erase_payload, verify_entry_chain
 from .errors import PactError
@@ -37,6 +41,36 @@ DEFAULT_TOKEN_DAYS = 30
 PREFERENCES_MAX = 4000
 """Characters of JSON an agent's preferences may take: they ride along in every pact_whoami."""
 KEY_CLIENTS: tuple[Client, ...] = ("code", "runner")
+AGENT_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+OAUTH_CLIENTS: tuple[Client, ...] = ("chat", "cowork", "design")
+"""Clients that sign in through OAuth in a Claude app; the rest connect with a token."""
+SETUP_CODE_MINUTES = 15
+ROLE_SETTING = re.compile(r"PACT_RUNNER_[A-Z0-9_]+|DATABASE_URL")
+"""Settings a role may write into a Runner's env file: the runner's own and its test database."""
+CLIENT_NAMES = ("chat", "cowork", "design", "code", "gemini", "runner")
+
+
+def board_url() -> str:
+    """The board's public URL, for connector URLs and setup commands. The Admin API runs as its own
+    service, so it is told (``PACT_BOARD_URL``) or reads it off the admin audience."""
+    explicit = os.environ.get("PACT_BOARD_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    audience = os.environ.get("PACT_ADMIN_AUDIENCE", "").strip()
+    if audience.endswith("/admin"):
+        return audience.removesuffix("/admin")
+    return os.environ.get("PACT_PUBLIC_URL", "http://127.0.0.1:8787").rstrip("/")
+
+
+def role_scope(actions: list[str], project: str) -> list[str]:
+    return [board_scope(a, project) for a in actions]
+
+
+def render_settings(settings: dict[str, Any], project: str) -> dict[str, str]:
+    """A role's Runner settings for one project: ``{project}`` filled in, everything a string."""
+    return {k: str(v).replace("{project}", project) for k, v in settings.items()}
+
+
 """Clients that hold an Ed25519 key for verifiers outside the board (owner decision 2026-10-02)."""
 
 
@@ -140,45 +174,88 @@ class Admin:
 
         The token is shown once; only its hash is stored.
         """
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            out = await self._register(
+                conn,
+                agent_id,
+                by=by,
+                client=client,
+                projects=projects,
+                scope=scope,
+                limits=limits,
+                delegations=delegations,
+                mandate_days=mandate_days,
+                owner=owner,
+            )
+            out["token"] = await self._issue_token(conn, agent_id, token_days)
+            return out
+
+    async def _register(
+        self,
+        conn: Conn,
+        agent_id: str,
+        *,
+        by: str,
+        client: Client,
+        projects: list[str],
+        scope: list[str] | None,
+        limits: Limits | None,
+        delegations: int,
+        mandate_days: float,
+        owner: str | None = None,
+        role_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create the agent, its project links and its root mandate, in the caller's transaction."""
         if not projects:
             raise PactError("project_required", "an agent needs at least one project")
+        if not AGENT_ID.fullmatch(agent_id):
+            raise PactError("invalid_request", f"agent id {agent_id!r} must be lowercase letters, digits and dashes")
         if client in ("code", "runner") and len(projects) != 1:
             raise PactError("invalid_request", f"a {client} agent belongs to exactly one project")
         scope = scope or default_scope(client, projects)
         bad = [s for s in scope if not is_valid_scope(s)]
         if bad:
             raise PactError("invalid_request", f"invalid scope: {', '.join(bad)}")
-        async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
-            for p in projects:
-                row = await fetchone(conn, "SELECT production FROM projects WHERE id = %s", (p,))
-                if row is None:
-                    raise PactError("not_found", f"project {p} does not exist")
-                if client == "runner" and row["production"]:
-                    raise PactError("project_mismatch", f"project {p} is production; a Runner may not be registered on it")
-            await conn.execute("INSERT INTO agents (id, owner, client) VALUES (%s, %s, %s)", (agent_id, owner or by, client))
-            for p in projects:
-                await conn.execute("INSERT INTO agent_projects (agent_id, project_id) VALUES (%s, %s)", (agent_id, p))
-            mandate = await issue_root(
-                conn,
-                human=by,
-                holder=agent_id,
-                scope=scope,
-                limits=limits or {},
-                delegations=delegations,
-                expires_at=datetime.now(UTC) + timedelta(days=mandate_days),
-            )
-            await conn.execute("UPDATE agents SET root_mandate_id = %s WHERE id = %s", (mandate.id, agent_id))
-            token = await self._issue_token(conn, agent_id, token_days)
-            await self._log(
-                conn,
-                by,
-                "admin.agent.register",
-                {"agent": agent_id, "client": client, "projects": projects, "scope": scope, "limits": limits or {}},
-                project_id=projects[0] if len(projects) == 1 else None,
-                mandate_chain=[mandate.id],
-            )
-        return {"agent_id": agent_id, "root_mandate_id": mandate.id, "token": token, "connector_path": f"/mcp/a/{agent_id}"}
+        if await fetchone(conn, "SELECT 1 FROM agents WHERE id = %s", (agent_id,)):
+            raise PactError("invalid_request", f"agent {agent_id} already exists; pick another name")
+        for p in projects:
+            row = await fetchone(conn, "SELECT production FROM projects WHERE id = %s", (p,))
+            if row is None:
+                raise PactError("not_found", f"project {p} does not exist")
+            if client == "runner" and row["production"]:
+                raise PactError("project_mismatch", f"project {p} is production; a Runner may not be registered on it")
+        await conn.execute(
+            "INSERT INTO agents (id, owner, client, role_id) VALUES (%s, %s, %s, %s)", (agent_id, owner or by, client, role_id)
+        )
+        for p in projects:
+            await conn.execute("INSERT INTO agent_projects (agent_id, project_id) VALUES (%s, %s)", (agent_id, p))
+        mandate = await issue_root(
+            conn,
+            human=by,
+            holder=agent_id,
+            scope=scope,
+            limits=limits or {},
+            delegations=delegations,
+            expires_at=datetime.now(UTC) + timedelta(days=mandate_days),
+        )
+        await conn.execute("UPDATE agents SET root_mandate_id = %s WHERE id = %s", (mandate.id, agent_id))
+        await self._log(
+            conn,
+            by,
+            "admin.agent.register",
+            {
+                "agent": agent_id,
+                "client": client,
+                "projects": projects,
+                "scope": scope,
+                "limits": limits or {},
+                "role": role_id,
+            },
+            project_id=projects[0] if len(projects) == 1 else None,
+            mandate_chain=[mandate.id],
+        )
+        return {"agent_id": agent_id, "root_mandate_id": mandate.id, "connector_path": f"/mcp/a/{agent_id}"}
 
     async def _issue_token(self, conn: Conn, agent_id: str, days: float) -> str:
         token = new_token()
@@ -496,6 +573,230 @@ class Admin:
                 raise PactError("not_found", f"agent {agent_id} does not exist")
             await self._log(conn, by, "admin.agent.preferences", {"agent": agent_id, "preferences": preferences})
         return preferences
+
+    # ── hiring from roles ──────────────────────────────────────────────────
+
+    async def list_roles(self, *, archived: bool = False) -> list[dict[str, Any]]:
+        async with transaction(self.pool) as conn:
+            return await fetchall(
+                conn,
+                f"""SELECT id, name, description, client, actions, limits, delegations, mandate_days, token_days,
+                           settings, instructions, position, archived_at, updated_at, updated_by
+                    FROM agent_roles {"" if archived else "WHERE archived_at IS NULL"} ORDER BY position, id""",
+            )
+
+    async def save_role(self, role_id: str, fields: dict[str, Any], *, by: str) -> dict[str, Any]:
+        """Create or replace a role. Everything a hire will grant is checked here, once."""
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,30}", role_id):
+            raise PactError("invalid_request", f"role id {role_id!r} must be lowercase letters, digits and dashes")
+        name = str(fields.get("name") or "").strip()
+        client = fields.get("client")
+        actions = [str(a).strip() for a in fields.get("actions") or [] if str(a).strip()]
+        if not name or client not in CLIENT_NAMES or not actions:
+            raise PactError("invalid_request", "a role needs a name, a client and at least one action")
+        bad = [a for a in actions if "@" in a or not is_valid_scope(board_scope(a, "p"))]
+        if bad:
+            raise PactError("invalid_request", f"actions are project-relative, like task.work: {', '.join(bad)}")
+        limits = fields.get("limits") or {}
+        if not isinstance(limits, dict) or any(
+            not isinstance(v, int | float) or isinstance(v, bool) or v < 0 for v in limits.values()
+        ):
+            raise PactError("invalid_request", "limits must map names to numbers of at least 0")
+        settings = {str(k): str(v) for k, v in (fields.get("settings") or {}).items()}
+        wrong = [k for k in settings if not ROLE_SETTING.fullmatch(k)]
+        if wrong:
+            raise PactError("invalid_request", f"settings may only be PACT_RUNNER_* or DATABASE_URL: {', '.join(wrong)}")
+        row = (
+            role_id,
+            name,
+            str(fields.get("description") or ""),
+            client,
+            actions,
+            Jsonb(limits),
+            int(fields.get("delegations", 1)),
+            float(fields.get("mandate_days", 30)),
+            float(fields.get("token_days", 90)),
+            Jsonb(settings),
+            str(fields.get("instructions") or ""),
+            int(fields.get("position", 100)),
+            by,
+        )
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            try:
+                await conn.execute(
+                    """INSERT INTO agent_roles (id, name, description, client, actions, limits, delegations, mandate_days,
+                                                token_days, settings, instructions, position, updated_by)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description,
+                         client = EXCLUDED.client, actions = EXCLUDED.actions, limits = EXCLUDED.limits,
+                         delegations = EXCLUDED.delegations, mandate_days = EXCLUDED.mandate_days,
+                         token_days = EXCLUDED.token_days, settings = EXCLUDED.settings,
+                         instructions = EXCLUDED.instructions, position = EXCLUDED.position,
+                         archived_at = NULL, updated_at = now(), updated_by = EXCLUDED.updated_by""",
+                    row,
+                )
+            except psycopg.errors.CheckViolation as err:
+                raise PactError("invalid_request", f"role {role_id} is out of range: {err.diag.constraint_name}") from None
+            await self._log(conn, by, "admin.role.save", {"role": role_id, **{k: v for k, v in fields.items()}})
+        return {"ok": True, "role": role_id}
+
+    async def archive_role(self, role_id: str, *, by: str) -> None:
+        """Retire a role: no new hires. Agents already hired keep working."""
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            cur = await conn.execute("UPDATE agent_roles SET archived_at = now() WHERE id = %s", (role_id,))
+            if cur.rowcount == 0:
+                raise PactError("not_found", f"role {role_id} does not exist")
+            await self._log(conn, by, "admin.role.archive", {"role": role_id})
+
+    async def _role(self, conn: Conn, role_id: str) -> dict[str, Any]:
+        role = await fetchone(conn, "SELECT * FROM agent_roles WHERE id = %s", (role_id,))
+        if role is None:
+            raise PactError("not_found", f"role {role_id} does not exist")
+        return role
+
+    async def hire(
+        self,
+        role_id: str,
+        project: str,
+        *,
+        by: str,
+        agent_id: str | None = None,
+        limits: Limits | None = None,
+        delegations: int | None = None,
+        days: float | None = None,
+        replaces: str | None = None,
+        owner: str | None = None,
+    ) -> dict[str, Any]:
+        """Hire an agent into a role for one project: register it with the role's scope, budget and
+        term, and say how it connects. An agent that signs in through a Claude app gets its
+        connector URL; one that uses a token gets a one-time setup code, never the token itself.
+        With ``replaces``, the old agent is banned and points to the new one. ``owner`` hires it for
+        another registered person: an agent that signs in through OAuth answers only to its owner."""
+        agent_id = agent_id or f"{role_id}-{project}"
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            if owner and not await fetchone(conn, "SELECT 1 FROM humans WHERE id = %s", (owner,)):
+                raise PactError("not_found", f"{owner} is not a registered person")
+            role = await self._role(conn, role_id)
+            if role["archived_at"]:
+                raise PactError("invalid_request", f"role {role_id} is archived")
+            out = await self._register(
+                conn,
+                agent_id,
+                by=by,
+                client=role["client"],
+                projects=[project],
+                scope=role_scope(list(role["actions"]), project),
+                limits=limits if limits is not None else {k: float(v) for k, v in role["limits"].items()},
+                delegations=delegations if delegations is not None else role["delegations"],
+                mandate_days=days if days is not None else role["mandate_days"],
+                owner=owner,
+                role_id=role_id,
+            )
+            if replaces:
+                old = await fetchone(conn, "SELECT id FROM agents WHERE id = %s", (replaces,))
+                if old is None:
+                    raise PactError("not_found", f"agent {replaces} does not exist")
+                await conn.execute("UPDATE agents SET status = 'banned', replaced_by = %s WHERE id = %s", (agent_id, replaces))
+                await conn.execute(
+                    "UPDATE agent_tokens SET revoked_at = now() WHERE agent_id = %s AND revoked_at IS NULL", (replaces,)
+                )
+                await self._log(conn, by, "admin.agent.replace", {"agent": replaces, "replaced_by": agent_id})
+            out["role"] = role_id
+            out["connect"] = await self._connect_info(conn, agent_id, role["client"], by)
+            return out
+
+    async def _connect_info(self, conn: Conn, agent_id: str, client: str, by: str) -> dict[str, Any]:
+        url = f"{board_url()}/mcp/a/{agent_id}"
+        if client in OAUTH_CLIENTS:
+            return {"kind": "oauth", "url": url}
+        code = "pcs_" + secrets.token_urlsafe(18)
+        expires = datetime.now(UTC) + timedelta(minutes=SETUP_CODE_MINUTES)
+        await conn.execute(
+            "INSERT INTO setup_codes (code_hash, agent_id, created_by, expires_at) VALUES (%s, %s, %s, %s)",
+            (sha256(code), agent_id, by, expires),
+        )
+        return {
+            "kind": "setup_code",
+            "code": code,
+            "expires_at": expires.isoformat(),
+            "command": f"pact-connect {board_url()} {code}",
+        }
+
+    async def setup_code(self, agent_id: str, *, by: str) -> dict[str, Any]:
+        """A fresh way to connect an agent that uses a token, e.g. on a new machine. Tokens it already
+        has keep working until revoked."""
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            agent = await get_agent(conn, agent_id)
+            if agent is None or agent.status == "banned":
+                raise PactError("not_found", f"agent {agent_id} does not exist or is banned")
+            info = await self._connect_info(conn, agent_id, agent.client, by)
+            await self._log(conn, by, "admin.agent.setup_code", {"agent": agent_id, "kind": info["kind"]})
+            return info
+
+    async def redeem_setup_code(self, code: str) -> dict[str, Any]:
+        """Trade a setup code for a token, once, within its time. Called by ``pact-connect`` on the
+        machine the agent will run on, so the token goes straight into its config."""
+        async with transaction(self.pool) as conn:
+            row = await fetchone(
+                conn,
+                """SELECT s.agent_id, s.created_by, a.client, a.status, a.role_id,
+                          (SELECT project_id FROM agent_projects p WHERE p.agent_id = a.id ORDER BY project_id LIMIT 1) AS project
+                   FROM setup_codes s JOIN agents a ON a.id = s.agent_id
+                   WHERE s.code_hash = %s AND s.used_at IS NULL AND s.expires_at > now()
+                   FOR UPDATE OF s""",
+                (sha256(code),),
+            )
+            if row is None or row["status"] == "banned":
+                raise PactError("forbidden", "this setup code is unknown, used or expired; get a new one in the Admin UI")
+            await conn.execute("UPDATE setup_codes SET used_at = now() WHERE code_hash = %s", (sha256(code),))
+            role = await self._role(conn, row["role_id"]) if row["role_id"] else None
+            token = await self._issue_token(conn, row["agent_id"], float(role["token_days"]) if role else DEFAULT_TOKEN_DAYS)
+            await self._log(conn, row["created_by"], "admin.agent.connect", {"agent": row["agent_id"]})
+            project = row["project"] or ""
+            return {
+                "agent_id": row["agent_id"],
+                "client": row["client"],
+                "project": project,
+                "board_url": board_url(),
+                "mcp_url": f"{board_url()}/mcp/a/{row['agent_id']}",
+                "token": token,
+                "role": role["id"] if role else None,
+                "settings": render_settings(role["settings"], project) if role else {},
+                "instructions": role["instructions"] if role else "",
+            }
+
+    async def renew(self, agent_id: str, *, by: str) -> dict[str, Any]:
+        """Renew an agent's term: a new root mandate with its role's scope, budget and length. The old
+        one keeps running until it expires; a Runner moves to the new one when it does."""
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            agent = await fetchone(
+                conn,
+                """SELECT a.id, a.status, a.role_id, (SELECT project_id FROM agent_projects p WHERE p.agent_id = a.id
+                   ORDER BY project_id LIMIT 1) AS project FROM agents a WHERE a.id = %s""",
+                (agent_id,),
+            )
+            if agent is None or agent["status"] == "banned":
+                raise PactError("not_found", f"agent {agent_id} does not exist or is banned")
+            if not agent["role_id"]:
+                raise PactError("invalid_request", f"agent {agent_id} was not hired into a role; change its permissions instead")
+            role = await self._role(conn, agent["role_id"])
+            mandate = await issue_root(
+                conn,
+                human=by,
+                holder=agent_id,
+                scope=role_scope(list(role["actions"]), agent["project"]),
+                limits={k: float(v) for k, v in role["limits"].items()},
+                delegations=role["delegations"],
+                expires_at=datetime.now(UTC) + timedelta(days=float(role["mandate_days"])),
+            )
+            await conn.execute("UPDATE agents SET root_mandate_id = %s WHERE id = %s", (mandate.id, agent_id))
+            await self._log(conn, by, "admin.agent.renew", {"agent": agent_id, "role": role["id"]}, mandate_chain=[mandate.id])
+            return {"agent_id": agent_id, "mandate_id": mandate.id, "expires_at": iso(mandate.expires_at)}
 
     async def set_halted(self, halted: bool, *, by: str) -> None:
         async with transaction(self.pool) as conn:

@@ -220,6 +220,30 @@ The board serves the hooks at `POST /hooks/a/<agent-id>/{session-start,user-prom
 agent tokens only. The script reports what the board cannot see in `X-Pact-Auto-Claim`, `X-Pact-Auto-Claim-From` and
 `X-Pact-Git-Clean` headers.
 
+## Hiring agents
+
+People hire agents from **roles** instead of registering them by hand. A role is a job description
+kept in the Admin UI (`agent_roles`; seven ship with the board: chat, code, runner, worker, secretary,
+design, cowork). It says what the agent can do, the project-relative actions its mandate grants
+(e.g. `task.work`), its budget (`limits`), how far it may delegate, how long its mandate and token
+last, and, for a Runner, the `PACT_RUNNER_*` settings and instructions its machine runs with.
+
+- `POST /admin/api/agents/hire {role, project, id?, limits?, delegations?, days?, owner?, replaces?}`
+  - registers `<role>-<project>` (or `id`) with the role's scope, budget and term in one step, and answers how to connect it.
+  - An agent that signs in through a Claude app (chat, cowork, design) gets its connector URL.
+  - One that uses a token (code, runner) gets a **one-time setup code**, valid for 15 minutes, never the token itself.
+  - `owner` hires it for another registered person. An OAuth agent answers only to its owner.
+  - `replaces` bans the old agent and makes the board tell anyone still calling it which agent took over.
+- `pact-connect <board-url> <setup-code>` (installed with this package) runs on the machine the agent will use. It posts the code to `POST /connect` and gets the token back once. It then writes the token straight into place:
+  - Claude Code: the `pact` MCP server for the project directory, plus the hooks env file.
+  - Runner: its env file (mode 600) and role instructions, a clone (`--repo`), and on macOS a LaunchAgent whose `PATH` holds the `claude`, `uv`, `gh` and `git` found on that machine.
+- `POST /admin/api/agents/<id>/renew` issues a fresh root mandate from the agent's role. A Runner moves to it when the old one ends, so renewing needs no restart.
+- `POST /admin/api/agents/<id>/setup-code` gives a new setup code, e.g. for a new machine.
+- Roles are managed with `GET /admin/api/roles`, `PUT /admin/api/roles/<id>` and `POST /admin/api/roles/<id>/archive`.
+
+Agents registered before roles existed take the role their name and client point to (`runner-x`,
+client runner → role runner).
+
 ## Runner
 
 `pact-runner` wakes headless Claude Code for work delegated to a `runner` agent, since the board
@@ -360,6 +384,7 @@ The test suite drops and recreates the `public` schema of the test database on e
 | `src/pact/hooks.py` | the Claude Code hook endpoints |
 | `hooks/` | the hook script and a settings example |
 | `src/pact_runner/` | `pact-runner`: polls, claims, runs `claude -p` in a worktree, reports; `guard.py` is the push guard |
+| `src/pact_runner/connect.py` | `pact-connect`: trades a setup code for a token and configures the machine |
 | `examples/runner/` | Runner settings and a macOS LaunchAgent |
 | `src/pact/migrations/` | SQL schema |
 | `tests/` | one test per done-criterion |

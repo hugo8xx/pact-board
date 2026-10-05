@@ -19,6 +19,7 @@ from pydantic import Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import credentials
+from .admin import Admin
 from .admin_api import build_admin_app
 from .auth import agent_for_token
 from .board import Agent, Board, ListFilter, ReportStatus
@@ -347,6 +348,9 @@ class PactApp:
                 return
             await self.admin_app(scope, receive, send)
             return
+        if path == "/connect" and scope["method"] == "POST":
+            await self._connect(receive, send)
+            return
         hook = _HOOK_PATH.match(path)
         if hook:
             await self._hook(scope, receive, send, hook.group(1), hook.group(2))
@@ -414,6 +418,32 @@ class PactApp:
         ]
         await send({"type": "http.response.start", "status": 200, "headers": headers})
         await send({"type": "http.response.body", "body": body})
+
+    async def _connect(self, receive: Receive, send: Send) -> None:
+        """``pact-connect`` trades a one-time setup code for the agent's token here. The code is the
+        only credential: 128 random bits, single use, valid for minutes."""
+        body = b""
+        while True:
+            message = await receive()
+            body += message.get("body", b"")
+            if len(body) > 4096:
+                await _respond(send, 413, {"error": "invalid_request", "message": "body too large"})
+                return
+            if not message.get("more_body"):
+                break
+        try:
+            code = str(json.loads(body or b"{}").get("code", ""))
+        except (ValueError, AttributeError):
+            code = ""
+        if not code.startswith("pcs_"):
+            await _respond(send, 400, {"error": "invalid_request", "message": 'send {"code": "pcs_..."}'})
+            return
+        try:
+            out = await Admin(self.pool).redeem_setup_code(code)
+        except PactError as err:
+            await _respond(send, 403, err.to_dict())
+            return
+        await _respond(send, 200, out, extra_headers=[(b"cache-control", b"no-store")])
 
     async def _hook(self, scope: Scope, receive: Receive, send: Send, agent_id: str, event: str) -> None:
         """Claude Code hooks authenticate with the agent's token only; OAuth is for the Claude apps."""

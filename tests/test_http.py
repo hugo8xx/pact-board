@@ -112,3 +112,20 @@ async def test_revoked_token_stops_working(world: World, server_url: str) -> Non
             json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
         )
     assert r.status_code == 401
+
+
+async def test_connect_trades_a_setup_code_for_a_token_once(world: World, server_url: str) -> None:
+    await world.project("web")
+    code = (await world.admin.hire("runner", "web", by="boss"))["connect"]["code"]
+    async with httpx2.AsyncClient(timeout=5) as http:
+        bad = await http.post(f"{server_url}/connect", json={"code": "nope"})
+        ok = await http.post(f"{server_url}/connect", json={"code": code})
+        again = await http.post(f"{server_url}/connect", json={"code": code})
+    assert bad.status_code == 400
+    assert ok.status_code == 200 and ok.headers["cache-control"] == "no-store"
+    body = ok.json()
+    assert body["agent_id"] == "runner-web" and body["token"].startswith("pact_")
+    assert again.status_code == 403 and again.json()["error"] == "forbidden"
+    async with session(f"{server_url}/mcp/a/runner-web", body["token"]) as s:
+        me = payload(await s.call_tool("pact_whoami", {}))
+    assert me["agent"]["id"] == "runner-web"
