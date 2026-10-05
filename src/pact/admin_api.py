@@ -163,6 +163,46 @@ class AdminApi:
                    GROUP BY a.id ORDER BY a.id""",
             )
 
+    async def agent_connection(self, request: Request, _h: str) -> Any:
+        """Whether an agent has connected yet, for the Connection Wizard to poll. Shows when its
+        latest setup code was made, expires and was used, never the code or its hash."""
+        agent_id = request.path_params["agent_id"]
+        async with transaction(self.pool) as conn:
+            row = await fetchone(
+                conn,
+                """SELECT a.id, a.last_seen, a.created_at, now() AS now,
+                          (SELECT count(*) FROM agent_tokens t
+                            WHERE t.agent_id = a.id AND t.revoked_at IS NULL AND t.expires_at > now()) AS live_tokens
+                   FROM agents a WHERE a.id = %s""",
+                (agent_id,),
+            )
+            if row is None:
+                raise PactError("not_found", f"agent {agent_id} does not exist")
+            code = await fetchone(
+                conn,
+                """SELECT created_at, expires_at, used_at FROM setup_codes
+                   WHERE agent_id = %s ORDER BY created_at DESC LIMIT 1""",
+                (agent_id,),
+            )
+        seen, hired = row["last_seen"], row["created_at"]
+        used = code["used_at"] if code else None
+        if seen is not None and ((used is not None and seen >= used) or (code is None and seen >= hired)):
+            state = "connected"
+        elif used is not None:
+            state = "code_redeemed"
+        elif code is not None and code["expires_at"] <= row["now"]:
+            state = "expired"
+        else:
+            state = "waiting_for_code"
+        return {
+            "agent_id": row["id"],
+            "state": state,
+            "setup_code": dict(code) if code else None,
+            "live_tokens": row["live_tokens"],
+            "last_seen": seen,
+            "hired_at": hired,
+        }
+
     async def projects(self, _r: Request, _h: str) -> Any:
         async with transaction(self.pool) as conn:
             return await fetchall(
@@ -542,6 +582,7 @@ def build_admin_app(pool: AsyncConnectionPool[Conn], verifier: Verifier) -> Star
             Route(f"{p}/agents", r(a.agents)),
             Route(f"{p}/agents", r(a.register_agent), methods=["POST"]),
             Route(f"{p}/agents/hire", r(a.hire), methods=["POST"]),
+            Route(f"{p}/agents/{{agent_id}}/connection", r(a.agent_connection)),
             Route(f"{p}/agents/{{agent_id}}/renew", r(a.renew), methods=["POST"]),
             Route(f"{p}/agents/{{agent_id}}/setup-code", r(a.setup_code), methods=["POST"]),
             Route(f"{p}/roles", r(a.roles)),
