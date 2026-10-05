@@ -7,7 +7,7 @@ import pytest
 
 from pact.db import fetchall, transaction
 from pact.errors import PactError
-from pact.notify import SlackSender, slack_message
+from pact.notify import SlackSender, slack_message, sweep_expiring
 
 from .conftest import HANDOFF, World
 
@@ -170,3 +170,46 @@ async def test_list_reports_the_head_of_the_board(world: World) -> None:
     await delegated(world)
     after = await world.board.list_tasks(world.agents["code-web"], mandate_id=world.roots["code-web"], filter="mine", limit=1)
     assert empty["head"] == 0 and after["head"] > 0
+
+
+# ── mandates and tokens running out ───────────────────────────────────────────
+
+
+async def sweep(w: World) -> int:
+    async with transaction(w.pool) as conn:
+        return await sweep_expiring(conn, 48)
+
+
+async def test_expiring_root_mandates_and_tokens_are_announced_once(world: World) -> None:
+    await world.project("web")
+    await world.agent("runner-web", "runner", ["web"], mandate_days=1, token_days=1)
+    await world.agent("code-web", "code", ["web"])  # 30 days: nothing to say
+    assert await sweep(world) == 2
+    assert await sweep(world) == 0
+    found = await rows(world)
+    assert {r["kind"] for r in found} == {"expiring"} and {r["agent_id"] for r in found} == {"runner-web"}
+    titles = sorted(r["title"] for r in found)
+    assert titles[0].startswith("runner-web: token จะหมดอายุ") and titles[1].startswith("runner-web: ใบมอบอำนาจราก จะหมดอายุ")
+    assert slack_message({**found[0], "project_id": "web"}, None)["text"].startswith("*ใกล้หมดอายุ* · web")
+
+
+async def test_expired_is_announced_but_old_news_is_not(world: World) -> None:
+    await world.project("web")
+    await world.agent("runner-web", "runner", ["web"], mandate_days=1, token_days=1)
+    await world.agent("old-web", "runner", ["web"], mandate_days=1, token_days=1)
+    async with transaction(world.pool) as conn:
+        await conn.execute("UPDATE mandates SET expires_at = now() - interval '1 hour' WHERE holder = 'runner-web'")
+        await conn.execute("UPDATE agent_tokens SET expires_at = now() - interval '1 hour' WHERE agent_id = 'runner-web'")
+        await conn.execute("UPDATE mandates SET expires_at = now() - interval '3 days' WHERE holder = 'old-web'")
+        await conn.execute("UPDATE agent_tokens SET expires_at = now() - interval '3 days' WHERE agent_id = 'old-web'")
+    assert await sweep(world) == 2
+    assert {(r["kind"], r["agent_id"]) for r in await rows(world)} == {("expired", "runner-web")}
+
+
+async def test_a_renewed_mandate_and_a_paused_agent_say_nothing(world: World) -> None:
+    await world.project("web")
+    await world.agent("runner-web", "runner", ["web"], mandate_days=1, token_days=30)
+    await world.agent("paused-web", "runner", ["web"], mandate_days=1, token_days=1)
+    await world.admin.set_agent_status("paused-web", "paused", by="boss")
+    await world.admin.issue_mandate("runner-web", by="boss", scope=["task.read@project:web", "task.work@project:web"], days=7)
+    assert await sweep(world) == 0

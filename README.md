@@ -140,7 +140,11 @@ and a chief-of-staff role (`examples/runner/secretary-role.md`) sends the CEO a 
 
 **Notifications.** The board tells people when it needs them: a task waiting for approval, a task
 deferred or asking a question (`input_required`), a top-level task closing, and a task delegated to a
-`chat`, `cowork` or `design` agent, which works only while a person has it open. Each is written to a
+`chat`, `cowork` or `design` agent, which works only while a person has it open. It also warns when
+an active agent's root mandate (the newest one a person issued) or its newest token is about to expire
+(`PACT_EXPIRY_WARN_HOURS`, default 48) and again once it has expired, since an agent without them simply
+stops. Each warning is sent once, and something that expired more than a day ago is never announced.
+The sender process checks every 10 minutes. Each is written to a
 `notifications` outbox in the same transaction as the event; a sender posts pending rows to Slack
 (`PACT_SLACK_WEBHOOK_URL`), retrying with backoff, so a Slack outage never fails board work. Messages
 carry a redacted, shortened title and first line of detail plus a link to the task, never its body.
@@ -230,7 +234,9 @@ cannot push to anyone. One process per runner agent, on a machine that has a log
      `defer`), and the Runner reports for it with `usage={"turns": n}`.
 4. It sends a heartbeat every 10 minutes. On `claim_lost` it kills that run.
 5. On `system_halted`, `agent_paused` or a dead runner mandate it kills every run and exits 0. A
-   supervisor should leave it stopped (done-criterion 20).
+   supervisor should leave it stopped (done-criterion 20). One exception: when its own mandate dies but
+   a person has issued it a newer root mandate (`pact-admin mandate-issue`), it carries on under that
+   one, so renewing a runner's mandate needs no restart. A new token still does.
 6. A question, a timeout, running out of turns or a usage limit becomes `input_required` with the
    session saved, never a retry loop. When a person answers and resumes the task, the Runner continues
    the same session (`--resume`, without resending the role). If that session is gone, it starts a

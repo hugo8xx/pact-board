@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any, Literal
 
 import httpx
@@ -21,7 +22,7 @@ from psycopg_pool import AsyncConnectionPool
 from .db import Conn, fetchall, transaction
 from .redact import redact_text
 
-Kind = Literal["approval_needed", "deferred", "question", "task_closed", "awaiting_session", "brief"]
+Kind = Literal["approval_needed", "deferred", "question", "task_closed", "awaiting_session", "brief", "expiring", "expired"]
 
 TITLE_MAX = 200
 DETAIL_MAX = 300
@@ -39,6 +40,8 @@ _HEADLINES: dict[str, str] = {
     "task_closed": "งานปิดแล้ว",
     "awaiting_session": "รอคนเปิด session",
     "brief": "รายงานประจำวัน",
+    "expiring": "ใกล้หมดอายุ",
+    "expired": "หมดอายุแล้ว agent หยุดทำงาน",
 }
 
 
@@ -105,6 +108,63 @@ def slack_message(row: dict[str, Any], admin_ui_url: str | None) -> dict[str, An
     return {"text": text, "mrkdwn": True}
 
 
+def warn_hours() -> float:
+    return float(os.environ.get("PACT_EXPIRY_WARN_HOURS", "48"))
+
+
+async def sweep_expiring(conn: Conn, within_hours: float | None = None) -> int:
+    """Queue a notice for every active agent whose root mandate (one a person issued) or newest token
+    expires within ``within_hours``, and again once it has expired, each only once. Something that
+    expired more than a day ago is old news and never announced."""
+    within = within_hours if within_hours is not None else warn_hours()
+    rows = await fetchall(
+        conn,
+        """WITH subjects AS (
+             SELECT 'mandate:' || m.id AS subject, m.holder AS agent, m.expires_at, 'mandate' AS what
+             FROM mandates m JOIN agents a ON a.id = m.holder
+             WHERE m.issuer_kind = 'human' AND m.revoked_at IS NULL AND a.status = 'active'
+               -- a newer root for the same agent that outlives this one means it was renewed
+               AND NOT EXISTS (SELECT 1 FROM mandates n WHERE n.holder = m.holder AND n.issuer_kind = 'human'
+                                 AND n.revoked_at IS NULL AND n.expires_at > m.expires_at + interval '1 hour')
+             UNION ALL
+             SELECT 'token:' || t.agent_id || ':' || max(t.expires_at), t.agent_id, max(t.expires_at), 'token'
+             FROM agent_tokens t JOIN agents a ON a.id = t.agent_id
+             WHERE t.revoked_at IS NULL AND a.status = 'active'
+             GROUP BY t.agent_id
+           )
+           SELECT s.*, CASE WHEN s.expires_at <= now() THEN 'expired' ELSE 'expiring' END AS stage,
+                  (SELECT min(project_id) FROM agent_projects WHERE agent_id = s.agent) AS project_id
+           FROM subjects s
+           WHERE s.expires_at <= now() + make_interval(secs => %s) AND s.expires_at > now() - interval '1 day'""",
+        (within * 3600,),
+    )
+    queued = 0
+    for r in rows:
+        if r["project_id"] is None:
+            continue
+        fresh = await fetchall(
+            conn,
+            "INSERT INTO expiry_notices (subject, stage) VALUES (%s, %s) ON CONFLICT DO NOTHING RETURNING subject",
+            (r["subject"], r["stage"]),
+        )
+        if not fresh:
+            continue
+        what = "ใบมอบอำนาจราก" if r["what"] == "mandate" else "token"
+        when = r["expires_at"].astimezone().strftime("%Y-%m-%d %H:%M %Z")
+        verb = "หมดอายุแล้วเมื่อ" if r["stage"] == "expired" else "จะหมดอายุ"
+        await enqueue(
+            conn,
+            r["stage"],
+            project_id=r["project_id"],
+            task_id=None,
+            agent_id=r["agent"],
+            title=f"{r['agent']}: {what} {verb} {when}",
+            detail=f"ต่ออายุด้วย pact-admin {'mandate-issue' if r['what'] == 'mandate' else 'token-issue'} แล้วอัปเดต env ของ agent",
+        )
+        queued += 1
+    return queued
+
+
 class SlackSender:
     def __init__(
         self,
@@ -113,8 +173,11 @@ class SlackSender:
         *,
         admin_ui_url: str | None = None,
         interval: float = 5.0,
+        sweep_every: float = 600.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
+        self.sweep_every = sweep_every
+        self._next_sweep = 0.0
         self.pool = pool
         self.webhook_url = webhook_url
         self.admin_ui_url = admin_ui_url
@@ -166,6 +229,10 @@ class SlackSender:
     async def _loop(self) -> None:
         while True:
             try:
+                if time.monotonic() >= self._next_sweep:
+                    self._next_sweep = time.monotonic() + self.sweep_every
+                    async with transaction(self.pool) as conn:
+                        await sweep_expiring(conn)
                 await self.send_pending()
             except Exception:  # noqa: BLE001 — the loop must outlive a bad batch or a database blip
                 log.exception("notification sender failed a batch")
