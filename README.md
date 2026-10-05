@@ -137,6 +137,13 @@ every session, so they are capped at 4000 characters.
 result goes out as one `brief` notification. The result is redacted, cut to 2800 characters and its
 Handoff section dropped, so it isn't just a "task closed" line. A runner with a `report.brief` schedule
 and a chief-of-staff role (`examples/runner/secretary-role.md`) sends the CEO a morning brief this way.
+When the result carries a `report` (`{"greeting", "sections": [{"title", "items": [{"text", "task_id"}]}]}`,
+which a Runner session returns in its structured output), the brief becomes one Slack card. Each item
+about a task gets an "open task" button.
+
+**Slack cards.** Notifications are Block Kit cards: an icon and headline, the task's title and detail,
+the project and agent, and a button to the task in the Admin UI (`PACT_ADMIN_UI_URL`). An incoming
+webhook can show link buttons but cannot receive clicks, so approving still happens in the Admin UI.
 
 **Notifications.** The board tells people when it needs them: a task waiting for approval, a task
 deferred or asking a question (`input_required`), a top-level task closing, and a task delegated to a
