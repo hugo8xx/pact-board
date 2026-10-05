@@ -21,6 +21,7 @@ pact-admin = "pact.cli:main"
 pact-admin-api = "pact.admin_server:main"
 pact-runner = "pact_runner.__main__:main"
 pact-runner-guard = "pact_runner.guard:main"
+pact-connect = "pact_runner.connect:main"
 
 [build-system]
 requires = ["hatchling"]

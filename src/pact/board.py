@@ -150,12 +150,20 @@ class Board:
         try:
             async with transaction(self.pool) as conn:
                 gate = await fetchone(
-                    conn, "SELECT s.halted, a.status FROM system_state s, agents a WHERE a.id = %s", (agent.id,)
+                    conn,
+                    "SELECT s.halted, a.status, a.replaced_by FROM system_state s, agents a WHERE a.id = %s",
+                    (agent.id,),
                 )
                 if gate is None:
                     raise PactError("agent_unknown", f"agent {agent.id} is not registered")
                 if gate["halted"]:
                     raise PactError("system_halted", "the kill switch is on; every call is refused until a human turns it off")
+                if gate["status"] != "active" and gate["replaced_by"]:
+                    raise PactError(
+                        "agent_paused",
+                        f"agent {agent.id} was replaced by {gate['replaced_by']}: connect to /mcp/a/{gate['replaced_by']} "
+                        "and use that agent from now on",
+                    )
                 if gate["status"] != "active":
                     raise PactError("agent_paused", f"agent {agent.id} is {gate['status']}")
                 await conn.execute("UPDATE agents SET last_seen = now() WHERE id = %s", (agent.id,))

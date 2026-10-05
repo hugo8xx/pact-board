@@ -151,6 +151,7 @@ class AdminApi:
             return await fetchall(
                 conn,
                 """SELECT a.id, a.owner, a.client, a.status, a.last_seen, a.created_at, a.root_mandate_id, a.preferences,
+                          a.role_id, a.replaced_by,
                           coalesce(array_agg(ap.project_id ORDER BY ap.project_id)
                                    FILTER (WHERE ap.project_id IS NOT NULL), '{}') AS projects,
                           (SELECT count(*) FROM agent_tokens t
@@ -389,6 +390,37 @@ class AdminApi:
         prefs = await self.admin.set_agent_preferences(request.path_params["agent_id"], b.get("preferences"), by=human)
         return {"ok": True, "preferences": prefs}
 
+    async def roles(self, request: Request, _h: str) -> Any:
+        return await self.admin.list_roles(archived=request.query_params.get("archived") == "1")
+
+    async def save_role(self, request: Request, human: str) -> Any:
+        return await self.admin.save_role(request.path_params["role_id"], await _body(request), by=human)
+
+    async def archive_role(self, request: Request, human: str) -> Any:
+        await self.admin.archive_role(request.path_params["role_id"], by=human)
+        return {"ok": True}
+
+    async def hire(self, request: Request, human: str) -> Any:
+        b = await _body(request)
+        limits = b.get("limits")
+        return await self.admin.hire(
+            str(b.get("role", "")),
+            str(b.get("project", "")),
+            by=human,
+            agent_id=(str(b["id"]).strip() or None) if b.get("id") else None,
+            limits={k: float(v) for k, v in limits.items()} if isinstance(limits, dict) else None,
+            delegations=int(b["delegations"]) if b.get("delegations") is not None else None,
+            days=float(b["days"]) if b.get("days") is not None else None,
+            replaces=b.get("replaces") or None,
+            owner=b.get("owner") or None,
+        )
+
+    async def renew(self, request: Request, human: str) -> Any:
+        return await self.admin.renew(request.path_params["agent_id"], by=human)
+
+    async def setup_code(self, request: Request, human: str) -> Any:
+        return await self.admin.setup_code(request.path_params["agent_id"], by=human)
+
     async def issue_token(self, request: Request, human: str) -> Any:
         b = await _body(request)
         return {"token": await self.admin.issue_token(request.path_params["agent_id"], by=human, days=float(b.get("days", 30)))}
@@ -509,6 +541,12 @@ def build_admin_app(pool: AsyncConnectionPool[Conn], verifier: Verifier) -> Star
             Route(f"{p}/context-versions/{{version_id:int}}/erase", r(a.context_erase), methods=["POST"]),
             Route(f"{p}/agents", r(a.agents)),
             Route(f"{p}/agents", r(a.register_agent), methods=["POST"]),
+            Route(f"{p}/agents/hire", r(a.hire), methods=["POST"]),
+            Route(f"{p}/agents/{{agent_id}}/renew", r(a.renew), methods=["POST"]),
+            Route(f"{p}/agents/{{agent_id}}/setup-code", r(a.setup_code), methods=["POST"]),
+            Route(f"{p}/roles", r(a.roles)),
+            Route(f"{p}/roles/{{role_id}}", r(a.save_role), methods=["PUT"]),
+            Route(f"{p}/roles/{{role_id}}/archive", r(a.archive_role), methods=["POST"]),
             Route(f"{p}/agents/{{agent_id}}/status", r(a.agent_status), methods=["POST"]),
             Route(f"{p}/agents/{{agent_id}}/preferences", r(a.agent_preferences), methods=["PUT"]),
             Route(f"{p}/agents/{{agent_id}}/tokens", r(a.issue_token), methods=["POST"]),
