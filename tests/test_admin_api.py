@@ -461,3 +461,78 @@ async def test_agents_show_how_many_live_keys_they_hold(
     await api(url, "DELETE", f"/agents/code-web/keys/{listed[0]['kid']}", boss)
     agents = {a["id"]: a for a in (await api(url, "GET", "/agents", boss)).json()}
     assert agents["code-web"]["keys"] == 1 and agents["chat-boss"]["keys"] == 0
+
+
+async def test_the_connection_wizard_polls_until_the_agent_connects(
+    world: World, board: tuple[str, ResourceSettings], issuer: Issuer
+) -> None:
+    from datetime import datetime
+
+    from pact.board import get_agent
+    from pact.crypto import sha256
+    from pact.db import transaction
+
+    at = datetime.fromisoformat
+    url, settings = board
+    await people(world)
+    vic = admin_token(issuer, settings, who="vic")
+
+    async def connection(agent_id: str) -> dict[str, Any]:
+        r = await api(url, "GET", f"/agents/{agent_id}/connection", vic)
+        assert r.status_code == 200
+        return dict(r.json())
+
+    async def call_board(agent_id: str) -> None:
+        async with transaction(world.pool) as conn:
+            agent = await get_agent(conn, agent_id)
+        assert agent
+        await world.board.whoami(agent)
+
+    await world.admin.hire("runner", "web", by="boss")
+    c = await connection("runner-web")
+    assert c["state"] == "waiting_for_code" and c["agent_id"] == "runner-web"
+    assert set(c) == {"agent_id", "state", "setup_code", "live_tokens", "last_seen", "hired_at"}
+    assert set(c["setup_code"]) == {"created_at", "expires_at", "used_at"} and c["setup_code"]["used_at"] is None
+    assert c["live_tokens"] == 0 and c["last_seen"] is None and c["hired_at"]
+
+    async with transaction(world.pool) as conn:
+        await conn.execute("UPDATE setup_codes SET expires_at = now() - interval '1 second'")
+    assert (await connection("runner-web"))["state"] == "expired"
+
+    code = (await world.admin.setup_code("runner-web", by="boss"))["code"]  # the latest code counts
+    assert (await connection("runner-web"))["state"] == "waiting_for_code"
+    text = (await api(url, "GET", "/agents/runner-web/connection", vic)).text
+    assert code not in text and sha256(code) not in text
+
+    await world.admin.redeem_setup_code(code)
+    c = await connection("runner-web")
+    assert c["state"] == "code_redeemed" and c["setup_code"]["used_at"] and c["live_tokens"] == 1
+
+    await call_board("runner-web")
+    c = await connection("runner-web")
+    assert c["state"] == "connected" and at(c["last_seen"]) >= at(c["setup_code"]["used_at"])
+
+    # A new code for a new machine: seen only before it was used is not connected yet.
+    await world.admin.redeem_setup_code((await world.admin.setup_code("runner-web", by="boss"))["code"])
+    c = await connection("runner-web")
+    assert c["state"] == "code_redeemed" and c["live_tokens"] == 2
+
+    # An OAuth agent never gets a code; it is connected once it calls the board after being hired.
+    await world.admin.hire("chat", "web", by="boss")
+    c = await connection("chat-web")
+    assert c["state"] == "waiting_for_code" and c["setup_code"] is None and c["live_tokens"] == 0
+    await call_board("chat-web")
+    c = await connection("chat-web")
+    assert c["state"] == "connected" and at(c["last_seen"]) >= at(c["hired_at"])
+
+
+async def test_the_connection_is_for_people_and_known_agents(
+    world: World, board: tuple[str, ResourceSettings], issuer: Issuer
+) -> None:
+    url, settings = board
+    await people(world)
+    r = await api(url, "GET", "/agents/nobody/connection", admin_token(issuer, settings, who="vic"))
+    assert r.status_code == 404 and r.json()["error"] == "not_found"
+    r = await api(url, "GET", "/agents/code-web/connection", admin_token(issuer, settings, who="stranger"))
+    assert r.status_code == 403 and r.json()["error"] == "forbidden"
+    assert (await api(url, "GET", "/agents/code-web/connection", None)).status_code == 401
