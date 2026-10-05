@@ -133,6 +133,11 @@ report style, …), set by people with `pact-admin agent-prefs` or the Admin API
 (`PUT /admin/api/agents/<id>/preferences`) and handed to the agent in `pact_whoami`. They ride along in
 every session, so they are capped at 4000 characters.
 
+**Daily brief.** A task with action `report.brief` is a report for people. When it completes, its whole
+result goes out as one `brief` notification. The result is redacted, cut to 2800 characters and its
+Handoff section dropped, so it isn't just a "task closed" line. A runner with a `report.brief` schedule
+and a chief-of-staff role (`examples/runner/secretary-role.md`) sends the CEO a morning brief this way.
+
 **Notifications.** The board tells people when it needs them: a task waiting for approval, a task
 deferred or asking a question (`input_required`), a top-level task closing, and a task delegated to a
 `chat`, `cowork` or `design` agent, which works only while a person has it open. Each is written to a
@@ -239,7 +244,13 @@ cannot push to anyone. One process per runner agent, on a machine that has a log
    person is asked. Splitting needs authority too: whoever delegates the task must include
    `task.post@project:<p>` in `child_scope`, otherwise the split is refused with `scope_exceeded`.
    `pact_list(filter="all", parent_task_id=…)` lists a task's subtasks.
-8. Each run's `rate_limit_event` reports how much of the 5-hour and 7-day quota is used. While a
+8. **Scheduled tasks.** `PACT_RUNNER_SCHEDULE` is a JSON list of jobs, for example
+   `{"at": "07:30", "title": "Daily brief", "action": "report.brief", "body": "… since {since} …"}`.
+   Once a day, from that local time on, the runner posts each job under its own mandate and claims it
+   itself. A sleeping Mac catches up the same day. `{date}` and `{since}` in the body are replaced:
+   `{since}` is the board cursor from when the previous run of that job was posted. `pact_list` answers
+   with `head`, the newest change, for this.
+9. Each run's `rate_limit_event` reports how much of the 5-hour and 7-day quota is used. While a
    window is past `PACT_RUNNER_RESERVE_FIVE_HOUR` (0.7) or `PACT_RUNNER_RESERVE_SEVEN_DAY` (0.8), or a
    limit was hit, no new run starts until that window resets, so the owner keeps the rest. There is
    also a daily run cap and optional quiet hours.

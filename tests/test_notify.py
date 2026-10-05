@@ -138,3 +138,35 @@ async def test_sender_delivers_once_and_backs_off_on_failure(world: World) -> No
     [row] = await rows(world)
     assert row["sent_at"] is not None
     await client.aclose()
+
+
+async def test_a_completed_brief_goes_whole_without_its_handoff(world: World) -> None:
+    await world.project("web")
+    await world.agent("chat-boss", "chat", ["web"])
+    await world.agent(
+        "sec-web", "runner", ["web"], scope=["task.read@project:web", "task.post@project:web", "report.brief@project:web"]
+    )
+    t = await world.board.post(
+        world.agents["sec-web"], project_id="web", title="Brief", action="report.brief", mandate_id=world.roots["sec-web"]
+    )
+    await world.board.claim(world.agents["sec-web"], task_id=t["task_id"], mandate_id=world.roots["sec-web"])
+    brief = (
+        "Good morning\n\nWaiting for you (1)\n1. Approve the plan   token=sk-ant-api03-abcdefghijklmnopqrstuv"
+        "\n\n## Handoff\n- Done: brief"
+    )
+    await world.board.report(
+        world.agents["sec-web"], task_id=t["task_id"], status="completed", mandate_id=world.roots["sec-web"], result=brief
+    )
+    [row] = await rows(world)
+    assert row["kind"] == "brief" and row["detail"].startswith("Good morning\n\nWaiting for you (1)\n1. Approve the plan")
+    assert "Handoff" not in row["detail"] and "sk-ant-api03" not in row["detail"]
+    text = slack_message({**row, "project_id": "web"}, None)["text"]
+    assert text.startswith("*รายงานประจำวัน* · web · Brief") and "\n\nGood morning\n\nWaiting for you (1)" in text
+
+
+async def test_list_reports_the_head_of_the_board(world: World) -> None:
+    await setup(world)
+    empty = await world.board.list_tasks(world.agents["code-web"], mandate_id=world.roots["code-web"])
+    await delegated(world)
+    after = await world.board.list_tasks(world.agents["code-web"], mandate_id=world.roots["code-web"], filter="mine", limit=1)
+    assert empty["head"] == 0 and after["head"] > 0

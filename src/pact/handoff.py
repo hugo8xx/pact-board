@@ -17,6 +17,20 @@ TEMPLATE = """\
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s*handoff\b", re.IGNORECASE | re.MULTILINE)
 
 
+def without_handoff(result: Any) -> Any:
+    """The result minus its Handoff section (from the heading to the next heading of the same or a
+    higher level, or the end): what a person reads, not what the next agent needs."""
+    if not isinstance(result, str):
+        return result
+    match = _HEADING.search(result)
+    if not match:
+        return result
+    level = len(match.group(0).strip()) - len(match.group(0).strip().lstrip("#"))
+    rest = result[match.end() :]
+    after = re.search(rf"^\s{{0,3}}#{{1,{level}}}\s", rest, re.MULTILINE)
+    return (result[: match.start()] + (rest[after.start() :] if after else "")).strip()
+
+
 def has_handoff(result: Any) -> bool:
     if isinstance(result, str):
         return bool(_HEADING.search(result))
