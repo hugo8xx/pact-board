@@ -10,6 +10,7 @@ link to the task in the Admin UI, never the task body.
 """
 
 import asyncio
+import json
 import logging
 import os
 from typing import Any, Literal
@@ -20,10 +21,12 @@ from psycopg_pool import AsyncConnectionPool
 from .db import Conn, fetchall, transaction
 from .redact import redact_text
 
-Kind = Literal["approval_needed", "deferred", "question", "task_closed", "awaiting_session"]
+Kind = Literal["approval_needed", "deferred", "question", "task_closed", "awaiting_session", "brief"]
 
 TITLE_MAX = 200
 DETAIL_MAX = 300
+BRIEF_MAX = 2800
+"""A brief is sent whole, up to this many characters (Slack shows about 3000 in one section)."""
 MAX_ATTEMPTS = 8
 BATCH = 20
 
@@ -35,11 +38,20 @@ _HEADLINES: dict[str, str] = {
     "question": "agent ถามคำถาม",
     "task_closed": "งานปิดแล้ว",
     "awaiting_session": "รอคนเปิด session",
+    "brief": "รายงานประจำวัน",
 }
 
 
 def _clip(text: str, limit: int) -> str:
     text = " ".join(redact_text(text).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _clip_text(value: Any, limit: int) -> str:
+    """Like _clip, but keeps the lines: a brief is read as a list, not one sentence."""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    lines = [" ".join(line.split()) for line in redact_text(text).splitlines()]
+    text = "\n".join(lines).strip()
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
@@ -63,10 +75,12 @@ async def enqueue(
     title: str,
     detail: Any = None,
 ) -> None:
+    """Detail is cut to its first line, except for a brief, which goes whole (up to BRIEF_MAX)."""
+    text = _clip_text(detail, BRIEF_MAX) if kind == "brief" and detail else _clip(_first_line(detail), DETAIL_MAX)
     await conn.execute(
         """INSERT INTO notifications (kind, project_id, task_id, agent_id, title, detail)
            VALUES (%s, %s, %s, %s, %s, %s)""",
-        (kind, project_id, task_id, agent_id, _clip(title, TITLE_MAX), _clip(_first_line(detail), DETAIL_MAX) or None),
+        (kind, project_id, task_id, agent_id, _clip(title, TITLE_MAX), text or None),
     )
 
 
@@ -83,7 +97,9 @@ def slack_message(row: dict[str, Any], admin_ui_url: str | None) -> dict[str, An
     lines = [f"*{headline}* · {_escape(row['project_id'])} · {title}"]
     if row.get("agent_id"):
         lines.append(f"โดย {_escape(row['agent_id'])}")
-    if row.get("detail"):
+    if row.get("detail") and row["kind"] == "brief":
+        lines += ["", _escape(row["detail"])]
+    elif row.get("detail"):
         lines.append(f"> {_escape(row['detail'])}")
     text = "\n".join(lines)
     return {"text": text, "mrkdwn": True}

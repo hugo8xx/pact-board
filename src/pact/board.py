@@ -17,7 +17,7 @@ from .crypto import iso
 from .db import Conn, fetchall, fetchone, transaction
 from .entries import EntryInput, append_entry
 from .errors import PactError
-from .handoff import require_handoff
+from .handoff import require_handoff, without_handoff
 from .keys import keyring
 from .mandates import (
     Chain,
@@ -68,6 +68,9 @@ class AutoClaimGate:
 
 
 """Clients that post and watch work; they never claim it."""
+
+BRIEF_ACTION = "report.brief"
+"""A task of this action is a report for people: completed, its whole result is sent to them."""
 
 TERMINAL_STATUSES = ("completed", "failed", "canceled", "rejected")
 """A task in one of these is done for good; the mandate delegated for it dies with it."""
@@ -426,12 +429,17 @@ class Board:
                    ORDER BY change_seq LIMIT 200""",
                 params,
             )
+            head = await fetchone(
+                conn, "SELECT coalesce(max(change_seq), 0) AS head FROM tasks WHERE project_id = ANY(%(projects)s)", params
+            )
             return {
                 # Deferred tasks come back in their own list only, never twice.
                 "tasks": [_summary(t) for t in rows if not t["deferred"]],
                 "deferred": [_summary(t) for t in deferred],
                 "next_since": max([cursor, *(t["change_seq"] for t in rows)]),
                 "has_more": len(rows) == n,
+                # The newest change in these projects: a cursor for "everything after now".
+                "head": head["head"] if head else 0,
             }
 
         return await self._call(agent, "pact_list", payload, run)
@@ -574,7 +582,17 @@ class Board:
                 "UPDATE tasks SET status = %s, result = %s WHERE id = %s",
                 (status, Jsonb(result) if result is not None else None, task_id),
             )
-            if task["parent_task_id"] is None:
+            if task["action"] == BRIEF_ACTION and status == "completed":
+                await notify(
+                    conn,
+                    "brief",
+                    project_id=project.id,
+                    task_id=task_id,
+                    agent_id=agent.id,
+                    title=task["title"],
+                    detail=without_handoff(result),
+                )
+            elif task["parent_task_id"] is None:
                 await notify(
                     conn,
                     "task_closed",
