@@ -1,5 +1,6 @@
 """Tell people when the board needs them: a task waiting for approval, a task handed back to
-humans, a top-level task closed.
+humans, a top-level task closed, a task delegated to an agent that only works while a person has it
+open (chat, cowork, design).
 
 `enqueue` writes a row inside the caller's transaction, so a notification exists exactly when its
 event does. `SlackSender` delivers pending rows to a Slack incoming webhook from whichever process
@@ -19,7 +20,7 @@ from psycopg_pool import AsyncConnectionPool
 from .db import Conn, fetchall, transaction
 from .redact import redact_text
 
-Kind = Literal["approval_needed", "deferred", "question", "task_closed"]
+Kind = Literal["approval_needed", "deferred", "question", "task_closed", "awaiting_session"]
 
 TITLE_MAX = 200
 DETAIL_MAX = 300
@@ -33,6 +34,7 @@ _HEADLINES: dict[str, str] = {
     "deferred": "ส่งกลับให้คนตัดสิน",
     "question": "agent ถามคำถาม",
     "task_closed": "งานปิดแล้ว",
+    "awaiting_session": "รอคนเปิด session",
 }
 
 

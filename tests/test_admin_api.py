@@ -114,6 +114,19 @@ async def test_register_pause_and_revoke_from_the_ui(world: World, board: tuple[
     assert out["root_mandate_id"] not in alive
 
 
+async def test_agent_preferences_from_the_ui(world: World, board: tuple[str, ResourceSettings], issuer: Issuer) -> None:
+    url, settings = board
+    await people(world)
+    boss, vic = admin_token(issuer, settings), admin_token(issuer, settings, who="vic")
+    prefs = {"language": "th"}
+    assert (await api(url, "PUT", "/agents/code-web/preferences", vic, {"preferences": prefs})).status_code == 403
+    r = await api(url, "PUT", "/agents/code-web/preferences", boss, {"preferences": prefs})
+    assert r.json() == {"ok": True, "preferences": prefs}
+    assert (await api(url, "PUT", "/agents/code-web/preferences", boss, {"preferences": "th"})).status_code == 400
+    listed = {a["id"]: a for a in (await api(url, "GET", "/agents", boss)).json()}
+    assert listed["code-web"]["preferences"] == prefs and listed["chat-boss"]["preferences"] == {}
+
+
 async def test_refused_calls_show_in_the_audit_log(world: World, board: tuple[str, ResourceSettings], issuer: Issuer) -> None:
     url, settings = board
     await people(world)
