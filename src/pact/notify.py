@@ -5,8 +5,8 @@ open (chat, cowork, design).
 `enqueue` writes a row inside the caller's transaction, so a notification exists exactly when its
 event does. `SlackSender` delivers pending rows to a Slack incoming webhook from whichever process
 has ``PACT_SLACK_WEBHOOK_URL`` set (the Admin API service in production). Delivery failures retry
-with backoff and never touch board work. Messages carry a redacted, shortened title and detail and a
-link to the task in the Admin UI, never the task body.
+with backoff and never touch board work. Messages are Block Kit cards (`slack_cards`) carrying a
+redacted, shortened title and detail and a button to the task in the Admin UI, never the task body.
 """
 
 import asyncio
@@ -21,6 +21,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from .db import Conn, fetchall, transaction
 from .redact import redact_text
+from .slack_cards import card, clean_report
 
 Kind = Literal["approval_needed", "deferred", "question", "task_closed", "awaiting_session", "brief", "expiring", "expired"]
 
@@ -78,8 +79,15 @@ async def enqueue(
     title: str,
     detail: Any = None,
 ) -> None:
-    """Detail is cut to its first line, except for a brief, which goes whole (up to BRIEF_MAX)."""
-    text = _clip_text(detail, BRIEF_MAX) if kind == "brief" and detail else _clip(_first_line(detail), DETAIL_MAX)
+    """Detail is cut to its first line, except for a brief, which goes whole: structured sections
+    (a ``report``) as JSON for a card, or text up to BRIEF_MAX."""
+    if kind == "brief" and isinstance(detail, dict) and isinstance(detail.get("report"), dict):
+        report = clean_report(detail["report"])
+        text = json.dumps(report, ensure_ascii=False) if report else _clip_text(detail.get("text") or "", BRIEF_MAX)
+    elif kind == "brief" and detail:
+        text = _clip_text(detail, BRIEF_MAX)
+    else:
+        text = _clip(_first_line(detail), DETAIL_MAX)
     await conn.execute(
         """INSERT INTO notifications (kind, project_id, task_id, agent_id, title, detail)
            VALUES (%s, %s, %s, %s, %s, %s)""",
@@ -87,25 +95,8 @@ async def enqueue(
     )
 
 
-def _escape(text: str) -> str:
-    # Slack mrkdwn treats these three as control characters.
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
 def slack_message(row: dict[str, Any], admin_ui_url: str | None) -> dict[str, Any]:
-    headline = _HEADLINES.get(row["kind"], row["kind"])
-    title = _escape(row["title"])
-    if admin_ui_url and row.get("task_id"):
-        title = f"<{admin_ui_url.rstrip('/')}/tasks/{row['task_id']}|{title}>"
-    lines = [f"*{headline}* · {_escape(row['project_id'])} · {title}"]
-    if row.get("agent_id"):
-        lines.append(f"โดย {_escape(row['agent_id'])}")
-    if row.get("detail") and row["kind"] == "brief":
-        lines += ["", _escape(row["detail"])]
-    elif row.get("detail"):
-        lines.append(f"> {_escape(row['detail'])}")
-    text = "\n".join(lines)
-    return {"text": text, "mrkdwn": True}
+    return card(row, _HEADLINES.get(row["kind"], row["kind"]), admin_ui_url)
 
 
 def warn_hours() -> float:

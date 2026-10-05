@@ -1,5 +1,6 @@
 """Notifications: written with the event, delivered to Slack by a separate sender."""
 
+import json
 from typing import Any
 
 import httpx
@@ -104,8 +105,12 @@ def test_slack_message_links_the_task_and_escapes_control_characters() -> None:
         {"kind": "deferred", "project_id": "web", "task_id": "t1", "agent_id": "code-web", "title": "a <b> & c", "detail": "x>y"},
         "https://admin.example/",
     )
-    assert msg["text"].startswith("*ส่งกลับให้คนตัดสิน* · web · <https://admin.example/tasks/t1|a &lt;b&gt; &amp; c>")
-    assert "> x&gt;y" in msg["text"]
+    header, body, context, actions = msg["blocks"]
+    assert header["text"]["text"] == "↩️ ส่งกลับให้คนตัดสิน"
+    assert body["text"]["text"] == "*<https://admin.example/tasks/t1|a &lt;b&gt; &amp; c>*\nx&gt;y"
+    assert context["elements"][0]["text"] == "web · โดย code-web"
+    assert actions["elements"][0]["url"] == "https://admin.example/tasks/t1"
+    assert msg["text"] == "↩️ ส่งกลับให้คนตัดสิน · a <b> & c"  # the phone notification line
 
 
 async def test_sender_delivers_once_and_backs_off_on_failure(world: World) -> None:
@@ -160,8 +165,9 @@ async def test_a_completed_brief_goes_whole_without_its_handoff(world: World) ->
     [row] = await rows(world)
     assert row["kind"] == "brief" and row["detail"].startswith("Good morning\n\nWaiting for you (1)\n1. Approve the plan")
     assert "Handoff" not in row["detail"] and "sk-ant-api03" not in row["detail"]
-    text = slack_message({**row, "project_id": "web"}, None)["text"]
-    assert text.startswith("*รายงานประจำวัน* · web · Brief") and "\n\nGood morning\n\nWaiting for you (1)" in text
+    blocks = slack_message({**row, "project_id": "web"}, None)["blocks"]
+    assert blocks[0]["text"]["text"] == "📋 รายงานประจำวัน"
+    assert blocks[2]["text"]["text"].startswith("Good morning\n\nWaiting for you (1)")
 
 
 async def test_list_reports_the_head_of_the_board(world: World) -> None:
@@ -190,7 +196,7 @@ async def test_expiring_root_mandates_and_tokens_are_announced_once(world: World
     assert {r["kind"] for r in found} == {"expiring"} and {r["agent_id"] for r in found} == {"runner-web"}
     titles = sorted(r["title"] for r in found)
     assert titles[0].startswith("runner-web: token จะหมดอายุ") and titles[1].startswith("runner-web: ใบมอบอำนาจราก จะหมดอายุ")
-    assert slack_message({**found[0], "project_id": "web"}, None)["text"].startswith("*ใกล้หมดอายุ* · web")
+    assert slack_message({**found[0], "project_id": "web"}, None)["text"].startswith("⏳ ใกล้หมดอายุ · runner-web")
 
 
 async def test_expired_is_announced_but_old_news_is_not(world: World) -> None:
@@ -213,3 +219,64 @@ async def test_a_renewed_mandate_and_a_paused_agent_say_nothing(world: World) ->
     await world.admin.set_agent_status("paused-web", "paused", by="boss")
     await world.admin.issue_mandate("runner-web", by="boss", scope=["task.read@project:web", "task.work@project:web"], days=7)
     assert await sweep(world) == 0
+
+
+async def test_a_structured_brief_becomes_one_card_with_a_button_per_item(world: World) -> None:
+    await world.project("web")
+    await world.agent(
+        "sec-web", "runner", ["web"], scope=["task.read@project:web", "task.post@project:web", "report.brief@project:web"]
+    )
+    sec, root = world.agents["sec-web"], world.roots["sec-web"]
+    t = await world.board.post(sec, project_id="web", title="รายงานประจำวัน 2026-10-06", action="report.brief", mandate_id=root)
+    await world.board.claim(sec, task_id=t["task_id"], mandate_id=root)
+    other = "11111111-2222-3333-4444-555555555555"
+    report = {
+        "greeting": "สวัสดีครับ",
+        "sections": [
+            {"title": "รอคุณตัดสิน (1)", "items": [{"text": "อนุมัติแผน token=sk-ant-api03-abcdefghijklmnopqrstuv", "task_id": other}]},
+            {"title": "ความคืบหน้า", "items": [{"text": "R3 เสร็จ"}, {"text": "bad id", "task_id": "not-a-uuid"}]},
+            {"title": "", "items": [{"text": "no title, dropped"}]},
+        ],
+    }
+    result = {"report": report, "handoff": "- Done: brief", "text": "fallback"}
+    await world.board.report(sec, task_id=t["task_id"], status="completed", mandate_id=root, result=result)
+    [row] = await rows(world)
+    stored = json.loads(row["detail"])
+    assert [s["title"] for s in stored["sections"]] == ["รอคุณตัดสิน (1)", "ความคืบหน้า"]
+    assert "sk-ant-api03" not in row["detail"] and stored["sections"][1]["items"][1] == {"text": "bad id"}
+
+    msg = slack_message({**row, "project_id": "web"}, "https://admin.example")
+    kinds = [b["type"] for b in msg["blocks"]]
+    assert kinds == [
+        "header",
+        "section",
+        "divider",
+        "section",
+        "section",
+        "divider",
+        "section",
+        "section",
+        "divider",
+        "context",
+        "actions",
+    ]
+    item = msg["blocks"][4]
+    assert item["text"]["text"].startswith("1. อนุมัติแผน") and item["accessory"]["url"] == f"https://admin.example/tasks/{other}"
+    assert msg["blocks"][7]["text"]["text"] == "• R3 เสร็จ\n• bad id"
+    assert msg["blocks"][-1]["elements"][0]["url"] == "https://admin.example/tasks"
+    assert msg["text"] == "📋 สวัสดีครับ"
+
+
+def test_a_card_never_exceeds_slack_limits() -> None:
+    report = {"greeting": "g", "sections": [{"title": f"s{i}", "items": [{"text": "x" * 600}] * 10} for i in range(6)]}
+    row = {
+        "kind": "brief",
+        "project_id": "web",
+        "task_id": None,
+        "agent_id": "sec",
+        "title": "t" * 400,
+        "detail": json.dumps(report),
+    }
+    msg = slack_message(row, "https://admin.example")
+    assert len(msg["blocks"]) <= 50 and len(msg["blocks"][0]["text"]["text"]) <= 150
+    assert all(len(b["text"]["text"]) <= 3000 for b in msg["blocks"] if b["type"] == "section")
