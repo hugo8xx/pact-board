@@ -138,11 +138,22 @@ def build_mcp(board: Board) -> MCPServer:
             int | None, Field(description="next_since from your previous call; returns only what changed after it.")
         ] = None,
         limit: int = 50,
+        parent_task_id: Annotated[
+            str | None, Field(description="Only the subtasks of this task, e.g. with filter=all to see how they went.")
+        ] = None,
     ) -> dict[str, Any]:
         """The only way to learn about work: the board cannot push. Call at the start of a session
         and after finishing each task. Deferred tasks come back in their own list for humans."""
         return await _guard(
-            board.list_tasks(_agent(ctx), mandate_id=mandate_id, filter=filter, project_id=project_id, since=since, limit=limit)
+            board.list_tasks(
+                _agent(ctx),
+                mandate_id=mandate_id,
+                filter=filter,
+                project_id=project_id,
+                since=since,
+                limit=limit,
+                parent_task_id=parent_task_id,
+            )
         )
 
     @mcp.tool(title="Claim a task")
