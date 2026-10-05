@@ -190,3 +190,20 @@ async def test_delegating_to_a_wakeless_agent_tells_people(world: World) -> None
     assert rows == [
         {"kind": "awaiting_session", "title": "draw it", "detail": "design-web (design) starts it only when someone opens it"}
     ]
+
+
+async def test_list_the_subtasks_of_a_task(world: World) -> None:
+    await setup(world)
+    chat, runner = world.agents["chat-boss"], world.agents["runner-web"]
+    parent = await task_for_runner(world, "parent")
+    other = await task_for_runner(world, "other")
+    for title, under in (("a", parent), ("b", parent), ("c", other)):
+        await world.board.post(chat, project_id="web", title=title, mandate_id=world.roots["chat-boss"], parent_task_id=under)
+    listed = await world.board.list_tasks(runner, mandate_id=world.roots["runner-web"], filter="all", parent_task_id=parent)
+    assert sorted(t["title"] for t in listed["tasks"]) == ["a", "b"]
+    await refused(
+        world.board.list_tasks(
+            runner, mandate_id=world.roots["runner-web"], filter="all", parent_task_id="00000000-0000-0000-0000-000000000000"
+        ),
+        "not_found",
+    )

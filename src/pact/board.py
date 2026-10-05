@@ -368,8 +368,16 @@ class Board:
         project_id: str | None = None,
         since: int | None = None,
         limit: int = 50,
+        parent_task_id: str | None = None,
     ) -> dict[str, Any]:
-        payload = {"mandate_id": mandate_id, "filter": filter, "project_id": project_id, "since": since, "limit": limit}
+        payload = {
+            "mandate_id": mandate_id,
+            "filter": filter,
+            "project_id": project_id,
+            "since": since,
+            "limit": limit,
+            "parent_task_id": parent_task_id,
+        }
 
         async def run(conn: Conn, ctx: _CallContext) -> dict[str, Any]:
             chain = await self._chain(conn, ctx, mandate_id, agent)
@@ -394,7 +402,18 @@ class Board:
                 "done": "(assignee = %(me)s OR delegate_to = %(me)s OR created_by = %(me)s) AND status = ANY(%(closed)s)",
                 "all": "true",
             }[filter]
-            params = {"projects": readable, "me": agent.id, "since": cursor, "limit": n, "closed": list(TERMINAL_STATUSES)}
+            if parent_task_id:
+                if await _get_task(conn, parent_task_id) is None:
+                    raise PactError("not_found", f"task {parent_task_id} does not exist")
+                where += " AND parent_task_id = %(parent)s"
+            params = {
+                "projects": readable,
+                "me": agent.id,
+                "since": cursor,
+                "limit": n,
+                "closed": list(TERMINAL_STATUSES),
+                "parent": parent_task_id,
+            }
             rows = await fetchall(
                 conn,
                 f"""SELECT * FROM tasks WHERE project_id = ANY(%(projects)s) AND change_seq > %(since)s AND {where}
