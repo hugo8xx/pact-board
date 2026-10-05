@@ -1,5 +1,6 @@
 """Mandates: issuing, verifying the whole chain, aggregate limits, revocation."""
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -387,12 +388,45 @@ async def _check_trusted_roots(conn: Conn, links: list[Mandate]) -> None:
             )
 
 
-async def consume_limits(conn: Conn, chain: Chain, consumption: Limits) -> None:
+def check_amounts(amounts: Limits | None, what: str) -> Limits:
+    """Amounts an agent hands in to be counted against limits: finite and never negative, so a
+    report cannot hand budget back."""
+    out: Limits = {}
+    for key, value in (amounts or {}).items():
+        if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+            raise PactError("invalid_request", f"{what} {key}={value!r} must be a number of at least 0")
+        out[key] = float(value)
+    return out
+
+
+async def remaining_limits(conn: Conn, chain: Chain) -> Limits:
+    """What is left of every limit in the chain: for each key, the smallest ``ceiling - used``
+    over the links that limit it, never below 0. A key no link limits is unlimited and absent."""
+    used = {
+        (str(r["mandate_id"]), r["limit_key"]): float(r["used"])
+        for r in await fetchall(
+            conn, "SELECT mandate_id, limit_key, used FROM limit_usage WHERE mandate_id = ANY(%s::uuid[])", (chain.ids,)
+        )
+    }
+    left: Limits = {}
+    for m in chain.links:
+        for key, ceiling in m.limits.items():
+            room = max(ceiling - used.get((m.id, key), 0.0), 0.0)
+            left[key] = min(left.get(key, room), room)
+    return left
+
+
+async def consume_limits(conn: Conn, chain: Chain, consumption: Limits, *, strict: bool = True) -> list[str]:
     """Add ``consumption`` to every mandate in the chain that limits that key.
 
     Usage is a running total, so children split from one parent share its ceiling. Rows are
     locked root first, so concurrent callers on one tree take locks in the same order.
+
+    ``strict`` refuses with ``limit_exceeded`` before going over a ceiling. Without it the amount
+    is recorded anyway — for usage that already happened, like the turns a finished run took — and
+    the keys that went over come back so the caller can stop spending.
     """
+    over: list[str] = []
     for m in chain.links:
         for key, amount in consumption.items():
             ceiling = m.limits.get(key)
@@ -406,12 +440,18 @@ async def consume_limits(conn: Conn, chain: Chain, consumption: Limits) -> None:
             )
             used = float(row["used"]) if row else 0.0
             if used + amount > ceiling:
-                raise PactError(
-                    "limit_exceeded", f"{key}: {used:g} used + {amount:g} requested is above {ceiling:g} on mandate {m.id}", m.id
-                )
+                if strict:
+                    raise PactError(
+                        "limit_exceeded",
+                        f"{key}: {used:g} used + {amount:g} requested is above {ceiling:g} on mandate {m.id}",
+                        m.id,
+                    )
+                if key not in over:
+                    over.append(key)
             await conn.execute(
                 "UPDATE limit_usage SET used = used + %s WHERE mandate_id = %s AND limit_key = %s", (amount, m.id, key)
             )
+    return over
 
 
 async def get_mandate(conn: Conn, mandate_id: str) -> Mandate | None:

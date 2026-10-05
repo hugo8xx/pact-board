@@ -19,7 +19,17 @@ from .entries import EntryInput, append_entry
 from .errors import PactError
 from .handoff import require_handoff
 from .keys import keyring
-from .mandates import Chain, Limits, consume_limits, get_mandate, issue_child, revoke_subtree, verify_chain
+from .mandates import (
+    Chain,
+    Limits,
+    check_amounts,
+    consume_limits,
+    get_mandate,
+    issue_child,
+    remaining_limits,
+    revoke_subtree,
+    verify_chain,
+)
 from .notify import enqueue as notify
 from .scope import action_covers, any_covers, board_scope
 
@@ -28,6 +38,8 @@ ListFilter = Literal["mine", "open", "done", "all"]
 ReportStatus = Literal["working", "completed", "failed", "canceled", "input_required"]
 
 POST_ONLY_CLIENTS: tuple[Client, ...] = ("chat", "cowork")
+WAKELESS_CLIENTS: tuple[Client, ...] = ("chat", "cowork", "design")
+"""Clients that work only while a person has them open: nothing can wake them for a task."""
 
 log = logging.getLogger(__name__)
 
@@ -188,6 +200,7 @@ class Board:
     async def whoami(self, agent: Agent) -> dict[str, Any]:
         async def run(conn: Conn, _ctx: _CallContext) -> dict[str, Any]:
             projects = await agent_projects(conn, agent.id)
+            prefs = await fetchone(conn, "SELECT preferences FROM agents WHERE id = %s", (agent.id,))
             mandates = await fetchall(
                 conn,
                 """SELECT id, parent_id, issuer, scope, limits, delegations_left, expires_at FROM mandates
@@ -204,7 +217,12 @@ class Board:
                 {"me": agent.id},
             )
             return {
-                "agent": {"id": agent.id, "client": agent.client, "owner": agent.owner},
+                "agent": {
+                    "id": agent.id,
+                    "client": agent.client,
+                    "owner": agent.owner,
+                    "preferences": prefs["preferences"] if prefs else {},
+                },
                 "projects": [
                     {
                         **p.__dict__,
@@ -271,6 +289,7 @@ class Board:
                     raise PactError("project_mismatch", f"parent task {parent_task_id} is not in project {project.id}")
 
             delegated_id: str | None = None
+            target: Agent | None = None
             if delegate_to:
                 target = await get_agent(conn, delegate_to)
                 target_projects = [p.id for p in await agent_projects(conn, delegate_to)] if target else []
@@ -312,6 +331,16 @@ class Board:
             if needs_approval:
                 await notify(
                     conn, "approval_needed", project_id=project.id, task_id=task_id, agent_id=agent.id, title=title, detail=action
+                )
+            if target is not None and target.client in WAKELESS_CLIENTS:
+                await notify(
+                    conn,
+                    "awaiting_session",
+                    project_id=project.id,
+                    task_id=task_id,
+                    agent_id=agent.id,
+                    title=title,
+                    detail=f"{target.id} ({target.client}) starts it only when someone opens it",
                 )
             notes = []
             if needs_approval:
@@ -388,11 +417,24 @@ class Board:
 
         return await self._call(agent, "pact_list", payload, run)
 
-    async def claim(self, agent: Agent, *, task_id: str, mandate_id: str, exclusive: bool = False) -> dict[str, Any]:
+    async def claim(
+        self,
+        agent: Agent,
+        *,
+        task_id: str,
+        mandate_id: str,
+        exclusive: bool = False,
+        reserve: Limits | None = None,
+    ) -> dict[str, Any]:
         """Take a task. With ``exclusive``, only while the agent holds no other task: the check and
-        the claim happen under a lock on the agent, so two sessions of one agent cannot each take one."""
+        the claim happen under a lock on the agent, so two sessions of one agent cannot each take one.
+
+        ``reserve`` is counted against the chain's limits in the claim's own transaction, e.g.
+        ``{"runs": 1}`` from a Runner about to start a run: no room left means no claim. The answer
+        carries ``budget``, what is left of each limit after the claim, when the chain has limits."""
 
         async def run(conn: Conn, ctx: _CallContext) -> dict[str, Any]:
+            reserved = check_amounts(reserve, "reserve")
             chain = await self._chain(conn, ctx, mandate_id, agent)
             task = await self._visible_task(conn, ctx, agent, task_id)
             project = await _get_project(conn, task["project_id"])
@@ -428,21 +470,37 @@ class Board:
                     raise PactError("already_claimed", f"task {task_id} is already claimed by {now['assignee']}")
                 state = f"{now['status']}{' (deferred)' if now['deferred'] else ''}" if now else "gone"
                 raise PactError("invalid_request", f"task {task_id} is {state} and cannot be claimed")
+            await consume_limits(conn, chain, reserved)
             out: dict[str, Any] = {"ok": True, "task_id": task_id, "status": "working"}
+            budget = await remaining_limits(conn, chain)
+            if budget:
+                out["budget"] = budget
             fmt = export_format()
             if fmt:
                 out.update(await _export_on_claim(conn, chain, fmt))
             return out
 
-        payload = {"task_id": task_id, "mandate_id": mandate_id, "exclusive": exclusive}
+        payload = {"task_id": task_id, "mandate_id": mandate_id, "exclusive": exclusive, "reserve": reserve}
         return await self._call(agent, "pact_claim", payload, run)
 
     async def report(
-        self, agent: Agent, *, task_id: str, status: ReportStatus, mandate_id: str, result: Any = None
+        self,
+        agent: Agent,
+        *,
+        task_id: str,
+        status: ReportStatus,
+        mandate_id: str,
+        result: Any = None,
+        usage: Limits | None = None,
     ) -> dict[str, Any]:
-        payload = {"task_id": task_id, "status": status, "result": result, "mandate_id": mandate_id}
+        """``usage`` is what the work already spent, e.g. ``{"turns": 12}`` after a run. It is
+        recorded against the chain's limits even past a ceiling, since it happened; the answer then
+        names the limits in ``budget_exceeded`` so the agent stops spending. Any report with usage
+        answers with ``budget``."""
+        payload = {"task_id": task_id, "status": status, "result": result, "mandate_id": mandate_id, "usage": usage}
 
         async def run(conn: Conn, ctx: _CallContext) -> dict[str, Any]:
+            spent = check_amounts(usage, "usage")
             chain = await self._chain(conn, ctx, mandate_id, agent)
             task = await self._visible_task(conn, ctx, agent, task_id)
             project = await _get_project(conn, task["project_id"])
@@ -458,8 +516,14 @@ class Board:
                     f"task {task_id} is no longer claimed by {agent.id}{holder}; do not overwrite the new holder's work",
                 )
             _require_scope(chain, board_scope(task["action"], project.id))
+            spending: dict[str, Any] = {}
+            if spent:
+                over = await consume_limits(conn, chain, spent, strict=False)
+                spending["budget"] = await remaining_limits(conn, chain)
+                if over:
+                    spending["budget_exceeded"] = over
             if status == "working":
-                return {"ok": True, "task_id": task_id, "status": "working", "note": "heartbeat recorded"}
+                return {"ok": True, "task_id": task_id, "status": "working", "note": "heartbeat recorded", **spending}
             if status == "input_required":
                 # Waiting on a person is a deferral: it joins the deferred queue, where a human
                 # answers and resumes it with the same mandate. Otherwise nobody could pick it up again.
@@ -484,6 +548,7 @@ class Board:
                     "task_id": task_id,
                     "status": "input_required",
                     "note": "A human sees this in the deferred list, answers, and resumes it. Stop working on it.",
+                    **spending,
                 }
             require_handoff(status, result)
             await conn.execute(
@@ -500,7 +565,7 @@ class Board:
                     title=task["title"],
                     detail=status,
                 )
-            out: dict[str, Any] = {"ok": True, "task_id": task_id, "status": status}
+            out: dict[str, Any] = {"ok": True, "task_id": task_id, "status": status, **spending}
             closed = await revoke_closed_task_mandates(conn, [task_id])
             if closed:
                 out["revoked_mandate"] = closed[0]["mandate_id"]

@@ -61,6 +61,11 @@ def _parser() -> argparse.ArgumentParser:
     ast.add_argument("status", choices=["active", "paused", "banned"])
     ast.add_argument("--by", required=True)
 
+    apf = sub.add_parser("agent-prefs", help="replace an agent's preferences (handed to it by pact_whoami)")
+    apf.add_argument("id")
+    apf.add_argument("preferences", type=json.loads, help='JSON object, e.g. {"language": "th"}')
+    apf.add_argument("--by", required=True)
+
     ti = sub.add_parser("token-issue")
     ti.add_argument("agent")
     ti.add_argument("--by", required=True)
@@ -156,6 +161,8 @@ async def _run(args: argparse.Namespace) -> Any:
                 )
             case "agent-status":
                 await a.set_agent_status(args.id, args.status, by=args.by)
+            case "agent-prefs":
+                return {"preferences": await a.set_agent_preferences(args.id, args.preferences, by=args.by)}
             case "token-issue":
                 return {"token": await a.issue_token(args.agent, by=args.by, days=args.days)}
             case "agent-key-add":

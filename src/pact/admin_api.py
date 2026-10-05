@@ -150,7 +150,7 @@ class AdminApi:
         async with transaction(self.pool) as conn:
             return await fetchall(
                 conn,
-                """SELECT a.id, a.owner, a.client, a.status, a.last_seen, a.created_at, a.root_mandate_id,
+                """SELECT a.id, a.owner, a.client, a.status, a.last_seen, a.created_at, a.root_mandate_id, a.preferences,
                           coalesce(array_agg(ap.project_id ORDER BY ap.project_id)
                                    FILTER (WHERE ap.project_id IS NOT NULL), '{}') AS projects,
                           (SELECT count(*) FROM agent_tokens t
@@ -384,6 +384,11 @@ class AdminApi:
         await self.admin.set_agent_status(request.path_params["agent_id"], b.get("status", "active"), by=human)
         return {"ok": True}
 
+    async def agent_preferences(self, request: Request, human: str) -> Any:
+        b = await _body(request)
+        prefs = await self.admin.set_agent_preferences(request.path_params["agent_id"], b.get("preferences"), by=human)
+        return {"ok": True, "preferences": prefs}
+
     async def issue_token(self, request: Request, human: str) -> Any:
         b = await _body(request)
         return {"token": await self.admin.issue_token(request.path_params["agent_id"], by=human, days=float(b.get("days", 30)))}
@@ -505,6 +510,7 @@ def build_admin_app(pool: AsyncConnectionPool[Conn], verifier: Verifier) -> Star
             Route(f"{p}/agents", r(a.agents)),
             Route(f"{p}/agents", r(a.register_agent), methods=["POST"]),
             Route(f"{p}/agents/{{agent_id}}/status", r(a.agent_status), methods=["POST"]),
+            Route(f"{p}/agents/{{agent_id}}/preferences", r(a.agent_preferences), methods=["PUT"]),
             Route(f"{p}/agents/{{agent_id}}/tokens", r(a.issue_token), methods=["POST"]),
             Route(f"{p}/agents/{{agent_id}}/tokens", r(a.revoke_tokens), methods=["DELETE"]),
             Route(f"{p}/agents/{{agent_id}}/keys", r(a.agent_keys)),

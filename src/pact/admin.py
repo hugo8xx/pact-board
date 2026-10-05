@@ -4,6 +4,7 @@ Agents never reach this module: nothing here is exposed over MCP.
 """
 
 import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -33,6 +34,8 @@ _RANK: dict[str, int] = {"viewer": 0, "approver": 1, "owner": 2}
 
 DEFAULT_MANDATE_DAYS = 30
 DEFAULT_TOKEN_DAYS = 30
+PREFERENCES_MAX = 4000
+"""Characters of JSON an agent's preferences may take: they ride along in every pact_whoami."""
 KEY_CLIENTS: tuple[Client, ...] = ("code", "runner")
 """Clients that hold an Ed25519 key for verifiers outside the board (owner decision 2026-10-02)."""
 
@@ -478,6 +481,21 @@ class Admin:
             if cur.rowcount == 0:
                 raise PactError("not_found", f"agent {agent_id} does not exist")
             await self._log(conn, by, "admin.agent.status", {"agent": agent_id, "status": status})
+
+    async def set_agent_preferences(self, agent_id: str, preferences: Any, *, by: str) -> dict[str, Any]:
+        """Replace an agent's preferences: how it should work, handed to it by pact_whoami. They
+        reach every session the agent opens, so they stay small."""
+        if not isinstance(preferences, dict):
+            raise PactError("invalid_request", "preferences must be a JSON object")
+        if len(json.dumps(preferences, ensure_ascii=False)) > PREFERENCES_MAX:
+            raise PactError("invalid_request", f"preferences are longer than {PREFERENCES_MAX} characters")
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            cur = await conn.execute("UPDATE agents SET preferences = %s WHERE id = %s", (Jsonb(preferences), agent_id))
+            if cur.rowcount == 0:
+                raise PactError("not_found", f"agent {agent_id} does not exist")
+            await self._log(conn, by, "admin.agent.preferences", {"agent": agent_id, "preferences": preferences})
+        return preferences
 
     async def set_halted(self, halted: bool, *, by: str) -> None:
         async with transaction(self.pool) as conn:

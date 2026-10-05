@@ -153,9 +153,16 @@ def build_mcp(board: Board) -> MCPServer:
         exclusive: Annotated[
             bool, Field(description="Refuse with agent_busy if you already hold a task: one task at a time.")
         ] = False,
+        reserve: Annotated[
+            dict[str, float] | None,
+            Field(description='Amounts to take from your mandate limits with the claim, e.g. {"runs": 1}.'),
+        ] = None,
     ) -> dict[str, Any]:
-        """Take a task before starting it. Exactly one agent wins; on already_claimed, move on."""
-        return await _guard(board.claim(_agent(ctx), task_id=task_id, mandate_id=mandate_id, exclusive=exclusive))
+        """Take a task before starting it. Exactly one agent wins; on already_claimed, move on.
+        The answer's budget is what is left of each limit on your mandate."""
+        return await _guard(
+            board.claim(_agent(ctx), task_id=task_id, mandate_id=mandate_id, exclusive=exclusive, reserve=reserve)
+        )
 
     @mcp.tool(title="Report on a task")
     async def pact_report(
@@ -182,10 +189,16 @@ def build_mcp(board: Board) -> MCPServer:
                 )
             ),
         ] = None,
+        usage: Annotated[
+            dict[str, float] | None,
+            Field(description='What the work spent against your mandate limits, e.g. {"turns": 12}.'),
+        ] = None,
     ) -> dict[str, Any]:
         """Send progress or the final result. claim_lost means the board released your claim — stop
-        and do not overwrite the new holder's work."""
-        return await _guard(board.report(_agent(ctx), task_id=task_id, status=status, mandate_id=mandate_id, result=result))
+        and do not overwrite the new holder's work. budget_exceeded in the answer means stop spending."""
+        return await _guard(
+            board.report(_agent(ctx), task_id=task_id, status=status, mandate_id=mandate_id, result=result, usage=usage)
+        )
 
     @mcp.tool(title="Defer to a human")
     async def pact_defer(
