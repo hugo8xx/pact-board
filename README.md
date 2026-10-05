@@ -204,6 +204,45 @@ The board serves the hooks at `POST /hooks/a/<agent-id>/{session-start,user-prom
 agent tokens only. The script reports what the board cannot see in `X-Pact-Auto-Claim`, `X-Pact-Auto-Claim-From` and
 `X-Pact-Git-Clean` headers.
 
+## Runner
+
+`pact-runner` wakes headless Claude Code for work delegated to a `runner` agent, since the board
+cannot push to anyone. One process per runner agent, on a machine that has a logged-in `claude`:
+
+1. Every 30 s it calls `pact_list(since=…)` and keeps the tasks delegated to it (`PACT_RUNNER_TAKE_OPEN=1`
+   also takes undelegated ones).
+2. It claims one with `reserve={"runs": 1}`, so a task whose budget has no run left is never
+   started. `--max-turns` is the smaller of `PACT_RUNNER_MAX_TURNS` and the turns left in the budget.
+3. It runs `claude -p --output-format stream-json` in a git worktree on branch `runner/<task>`. The
+   process gets its own process group. These limits apply:
+   - Only the tools in the allowlist, with `--permission-mode default`; never
+     `--dangerously-skip-permissions`.
+   - Only project settings (`--setting-sources project`), so a person's own allow rules never reach it.
+   - A PreToolUse guard (`pact-runner-guard`) refuses pushes to `main`/`master`/`stage`/`staging`/`release`,
+     force pushes and `gh pr merge`. Branch protection on the host is still the hard stop.
+   - The board as an MCP server, minus `pact_claim`/`pact_report`/`pact_defer`/`pact_revoke`. The session
+     answers through `--json-schema` structured output (`completed`, `failed`, `input_required` or
+     `defer`), and the Runner reports for it with `usage={"turns": n}`.
+4. It sends a heartbeat every 10 minutes. On `claim_lost` it kills that run.
+5. On `system_halted`, `agent_paused` or a dead runner mandate it kills every run and exits 0. A
+   supervisor should leave it stopped (done-criterion 20).
+6. A question, a timeout, running out of turns or a usage limit becomes `input_required` with the
+   session saved, never a retry loop. When a person answers and resumes the task, the Runner continues
+   the same session (`--resume`, without resending the role). If that session is gone, it starts a
+   fresh one once.
+7. Each run's `rate_limit_event` reports how much of the 5-hour and 7-day quota is used. While a
+   window is past `PACT_RUNNER_RESERVE_FIVE_HOUR` (0.7) or `PACT_RUNNER_RESERVE_SEVEN_DAY` (0.8), or a
+   limit was hit, no new run starts until that window resets, so the owner keeps the rest. There is
+   also a daily run cap and optional quiet hours.
+
+`PACT_RUNNER_AUTH=subscription` strips every Anthropic credential from the child's environment so the
+login is used; `api_key` passes `PACT_RUNNER_ANTHROPIC_API_KEY` instead.
+
+Settings are in `examples/runner/runner.env.example`, and a macOS LaunchAgent is in
+`examples/runner/com.example.pact-runner.plist`. Register the agent with a budget, e.g.
+`pact-admin agent-register runner-web --client runner --projects web --limits '{"runs": 50, "turns": 2000}' --days 7 --by <you>`.
+For a task, the budget a Runner follows is the one on the mandate delegated with that task.
+
 ## Admin API
 
 `/admin/api/*` is for people, not agents: it takes an OAuth access token whose audience is
@@ -287,6 +326,8 @@ The test suite drops and recreates the `public` schema of the test database on e
 | `src/pact/credentials/` | credential adapters (`tenuo.py`, `biscuit.py`); `tests/test_credential_conformance.py` runs every format |
 | `src/pact/hooks.py` | the Claude Code hook endpoints |
 | `hooks/` | the hook script and a settings example |
+| `src/pact_runner/` | `pact-runner`: polls, claims, runs `claude -p` in a worktree, reports; `guard.py` is the push guard |
+| `examples/runner/` | Runner settings and a macOS LaunchAgent |
 | `src/pact/migrations/` | SQL schema |
 | `tests/` | one test per done-criterion |
 
