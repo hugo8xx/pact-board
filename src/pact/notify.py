@@ -3,8 +3,9 @@ humans, a top-level task closed, a task delegated to an agent that only works wh
 open (chat, cowork, design).
 
 `enqueue` writes a row inside the caller's transaction, so a notification exists exactly when its
-event does. `SlackSender` delivers pending rows to a Slack incoming webhook from whichever process
-has ``PACT_SLACK_WEBHOOK_URL`` set (the Admin API service in production). Delivery failures retry
+event does. `SlackSender` (in the Admin API service) delivers pending rows to the Slack incoming webhook
+of the notification's organization; ``PACT_SLACK_WEBHOOK_URL`` serves the default organization
+until it sets its own. An organization with no webhook gets nothing sent. Delivery failures retry
 with backoff and never touch board work. Messages are Block Kit cards (`slack_cards`) carrying a
 redacted, shortened title and detail and a button to the task in the Admin UI, never the task body.
 """
@@ -20,6 +21,7 @@ import httpx
 from psycopg_pool import AsyncConnectionPool
 
 from .db import Conn, fetchall, transaction
+from .entries import DEFAULT_ORG
 from .redact import redact_text
 from .slack_cards import card, clean_report
 
@@ -89,9 +91,9 @@ async def enqueue(
     else:
         text = _clip(_first_line(detail), DETAIL_MAX)
     await conn.execute(
-        """INSERT INTO notifications (kind, project_id, task_id, agent_id, title, detail)
-           VALUES (%s, %s, %s, %s, %s, %s)""",
-        (kind, project_id, task_id, agent_id, _clip(title, TITLE_MAX), text or None),
+        """INSERT INTO notifications (kind, project_id, task_id, agent_id, title, detail, org_id)
+           SELECT %s, %s, %s, %s, %s, %s, org_id FROM projects WHERE id = %s""",
+        (kind, project_id, task_id, agent_id, _clip(title, TITLE_MAX), text or None, project_id),
     )
 
 
@@ -160,7 +162,7 @@ class SlackSender:
     def __init__(
         self,
         pool: AsyncConnectionPool[Conn],
-        webhook_url: str,
+        webhook_url: str | None,
         *,
         admin_ui_url: str | None = None,
         interval: float = 5.0,
@@ -177,11 +179,10 @@ class SlackSender:
         self._task: asyncio.Task[None] | None = None
 
     @classmethod
-    def from_env(cls, pool: AsyncConnectionPool[Conn]) -> "SlackSender | None":
-        url = os.environ.get("PACT_SLACK_WEBHOOK_URL")
-        if not url:
-            return None
-        return cls(pool, url, admin_ui_url=os.environ.get("PACT_ADMIN_UI_URL"))
+    def from_env(cls, pool: AsyncConnectionPool[Conn]) -> "SlackSender":
+        """Always a sender: each organization may set its own webhook. PACT_SLACK_WEBHOOK_URL, if set,
+        serves the organization that existed before organizations did, until it sets its own."""
+        return cls(pool, os.environ.get("PACT_SLACK_WEBHOOK_URL") or None, admin_ui_url=os.environ.get("PACT_ADMIN_UI_URL"))
 
     async def send_pending(self) -> int:
         """Deliver one batch. Rows are locked with SKIP LOCKED, so two senders never double-post."""
@@ -189,16 +190,25 @@ class SlackSender:
         async with transaction(self.pool) as conn:
             rows = await fetchall(
                 conn,
-                """SELECT id, kind, project_id, task_id::text AS task_id, agent_id, title, detail, attempts
-                   FROM notifications
-                   WHERE sent_at IS NULL AND attempts < %s AND next_attempt_at <= now()
-                   ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED""",
-                (MAX_ATTEMPTS, BATCH),
+                """SELECT n.id, n.kind, n.project_id, n.task_id::text AS task_id, n.agent_id, n.title, n.detail,
+                          n.attempts, COALESCE(o.slack_webhook_url, CASE WHEN n.org_id = %s THEN %s END) AS webhook
+                   FROM notifications n JOIN orgs o ON o.id = n.org_id
+                   WHERE n.sent_at IS NULL AND n.attempts < %s AND n.next_attempt_at <= now()
+                   ORDER BY n.id LIMIT %s FOR UPDATE OF n SKIP LOCKED""",
+                (DEFAULT_ORG, self.webhook_url, MAX_ATTEMPTS, BATCH),
             )
             for row in rows:
+                if not row["webhook"]:
+                    # Nowhere to send it: set aside for good, so it neither blocks the queue nor floods
+                    # Slack with old news once the organization sets a webhook.
+                    await conn.execute(
+                        "UPDATE notifications SET attempts = %s, last_error = %s WHERE id = %s",
+                        (MAX_ATTEMPTS, "no Slack webhook for this organization", row["id"]),
+                    )
+                    continue
                 error: str | None = None
                 try:
-                    response = await self.client.post(self.webhook_url, json=slack_message(row, self.admin_ui_url))
+                    response = await self.client.post(row["webhook"], json=slack_message(row, self.admin_ui_url))
                     if response.status_code >= 300:
                         error = f"slack answered {response.status_code}: {response.text[:200]}"
                 except httpx.HTTPError as exc:
