@@ -15,7 +15,9 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from pact import credentials
 from pact.admin_api import build_admin_app
+from pact.board import get_agent
 from pact.db import fetchall, fetchone, transaction
+from pact.errors import PactError
 from pact.keys import b64url
 from pact.oauth import ResourceSettings
 
@@ -269,3 +271,50 @@ async def test_entries_without_a_project_go_to_the_organizations_own_chain(world
     assert row == {"chain_key": "_system:rival", "org_id": "rival"}
     assert all(v["ok"] for v in await world.admin.verify_log("rival"))
     assert all(v["ok"] for v in await world.admin.verify_log("default"))
+
+
+async def test_a_refused_call_naming_another_organizations_project_stays_in_the_callers_log(world: World) -> None:
+    """An agent that names another organization's project or task is refused, and the record of
+    it goes to its own organization's log: the other organization never sees text it wrote, and its
+    own people see the attempt."""
+    ids = await two_organizations(world)
+    await world.admin.register_agent("code-acme", by="rex", client="code", projects=["acme"])
+    async with transaction(world.pool) as conn:
+        spy = await get_agent(conn, "code-acme")
+        root = await fetchone(conn, "SELECT root_mandate_id FROM agents WHERE id = 'code-acme'")
+    assert spy and root
+    before = await boss_state(world)
+    for call in (
+        world.board.post(spy, project_id="web", title="SPY-TEXT", mandate_id=str(root["root_mandate_id"])),
+        world.board.list_tasks(spy, mandate_id=str(root["root_mandate_id"]), project_id="web"),
+        world.board.claim(spy, task_id=ids["task"], mandate_id=str(root["root_mandate_id"])),
+    ):
+        with pytest.raises(Exception):  # noqa: B017 — any refusal; where it is logged is what matters
+            await call
+    async with transaction(world.pool) as conn:
+        theirs = await fetchall(conn, "SELECT e.id FROM entries e WHERE e.agent_id = 'code-acme' AND e.org_id = 'default'")
+        mine = await fetchall(
+            conn, "SELECT chain_key, project_id, task_id FROM entries WHERE agent_id = 'code-acme' AND org_id = 'rival'"
+        )
+    assert theirs == []
+    assert mine and all(r["chain_key"] in ("acme", "_system:rival") and r["project_id"] != "web" for r in mine)
+    assert all(str(r["task_id"]) != ids["task"] for r in mine)
+    assert await boss_state(world) == before
+    assert all(v["ok"] for v in await world.admin.verify_log("default"))
+    assert all(v["ok"] for v in await world.admin.verify_log("rival"))
+
+
+async def test_a_public_key_of_another_organization_is_not_named(world: World) -> None:
+    await two_organizations(world)
+    await world.admin.register_agent("code-acme", by="rex", client="code", projects=["acme"])
+    key = public_key()
+    await world.admin.add_agent_key("code-web", key, by="boss")
+    with pytest.raises(PactError) as info:
+        await world.admin.add_agent_key("code-acme", key, by="rex")
+    assert "code-web" not in info.value.message
+
+
+async def test_an_organization_with_no_log_yet_verifies_nothing(world: World) -> None:
+    async with transaction(world.pool) as conn:
+        await conn.execute("INSERT INTO orgs (id, name, system_chain) VALUES ('empty', 'Empty', '_system:empty')")
+    assert await world.admin.verify_log("empty") == []

@@ -27,7 +27,7 @@ from .board import (
 )
 from .crypto import iso, new_token, sha256
 from .db import Conn, fetchall, fetchone, transaction
-from .entries import DEFAULT_ORG, SYSTEM_CHAIN, EntryInput, append_entry, erase_payload, verify_entry_chain
+from .entries import DEFAULT_ORG, EntryInput, append_entry, erase_payload, verify_entry_chain
 from .errors import PactError
 from .keys import b64url, b64url_decode, public_key_from_text
 from .mandates import MAX_DEPTH, ImportedLink, Limits, get_mandate, issue_root, revoke_impact, revoke_subtree
@@ -400,9 +400,14 @@ class Admin:
                 raise PactError("not_found", f"agent {agent_id} does not exist")
             if agent.client not in KEY_CLIENTS:
                 raise PactError("invalid_request", f"{agent.client} agents do not hold keys; only {', '.join(KEY_CLIENTS)} do")
-            taken = await fetchone(conn, "SELECT agent_id FROM agent_keys WHERE public_key = %s", (raw,))
+            taken = await fetchone(
+                conn,
+                "SELECT k.agent_id, a.org_id FROM agent_keys k JOIN agents a ON a.id = k.agent_id WHERE k.public_key = %s",
+                (raw,),
+            )
             if taken:
-                raise PactError("invalid_request", f"this public key is already registered for {taken['agent_id']}")
+                whose = f" for {taken['agent_id']}" if taken["org_id"] == org else ""
+                raise PactError("invalid_request", f"this public key is already registered{whose}")
             await conn.execute(
                 "INSERT INTO agent_keys (agent_id, kid, public_key, created_by) VALUES (%s, %s, %s, %s)", (agent_id, kid, raw, by)
             )
@@ -1201,7 +1206,7 @@ class Admin:
                     (org, org),
                 )
             ]
-            return [(await verify_entry_chain(conn, k)).__dict__ for k in keys or [SYSTEM_CHAIN]]
+            return [(await verify_entry_chain(conn, k)).__dict__ for k in keys]
 
     async def write_note(
         self, project_id: str, key: str, *, by: str, title: str | None = None, body: str | None = None, archive: bool = False

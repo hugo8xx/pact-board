@@ -37,17 +37,24 @@ def _entry_hash(fields: dict[str, Any]) -> str:
     return sha256(canonical_json(fields))
 
 
-async def _org_of(conn: Conn, e: EntryInput) -> str:
-    """The organization an entry belongs to: its project's, else its agent's, else the one given."""
-    if e.project_id:
-        row = await fetchone(conn, "SELECT org_id FROM projects WHERE id = %s", (e.project_id,))
-        if row:
-            return str(row["org_id"])
+async def _place(conn: Conn, e: EntryInput) -> tuple[str, str | None]:
+    """The organization and project an entry is filed under. The actor decides the organization (its
+    agent's, else the one given, else the project's); a project of another organization is dropped,
+    so a refused call that names someone else's project lands in the caller's own log, not theirs."""
+    org: str | None = None
     if e.agent_id:
         row = await fetchone(conn, "SELECT org_id FROM agents WHERE id = %s", (e.agent_id,))
-        if row:
-            return str(row["org_id"])
-    return e.org_id or DEFAULT_ORG
+        org = str(row["org_id"]) if row else None
+    org = org or e.org_id
+    project_id = e.project_id
+    if project_id:
+        row = await fetchone(conn, "SELECT org_id FROM projects WHERE id = %s", (project_id,))
+        project_org = str(row["org_id"]) if row else None
+        if org is None:
+            org = project_org
+        elif project_org != org:
+            project_id = None
+    return org or DEFAULT_ORG, project_id
 
 
 async def append_entry(conn: Conn, e: EntryInput) -> tuple[int, str]:
@@ -56,9 +63,11 @@ async def append_entry(conn: Conn, e: EntryInput) -> tuple[int, str]:
     The payload is redacted and stored apart (so it can be erased on request); only its hash
     enters the chain. Chains are per project, so projects never queue behind each other.
     """
-    org = await _org_of(conn, e)
-    if e.project_id:
-        chain_key = e.project_id
+    org, project_id = await _place(conn, e)
+    # A task of a project that was dropped belongs to another organization too.
+    task_id = e.task_id if project_id or not e.project_id else None
+    if project_id:
+        chain_key = project_id
     else:
         row = await fetchone(conn, "SELECT system_chain FROM orgs WHERE id = %s", (org,))
         chain_key = row["system_chain"] if row else SYSTEM_CHAIN
@@ -76,8 +85,8 @@ async def append_entry(conn: Conn, e: EntryInput) -> tuple[int, str]:
     at = datetime.now(UTC)
     fields = {
         "chain_key": chain_key,
-        "project_id": e.project_id,
-        "task_id": e.task_id,
+        "project_id": project_id,
+        "task_id": task_id,
         "agent_id": e.agent_id,
         "actor": e.actor,
         "mandate_chain": e.mandate_chain,
@@ -95,8 +104,8 @@ async def append_entry(conn: Conn, e: EntryInput) -> tuple[int, str]:
            VALUES (%s, %s, %s, %s, %s, %s::uuid[], %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
         (
             chain_key,
-            e.project_id,
-            e.task_id,
+            project_id,
+            task_id,
             e.agent_id,
             e.actor,
             e.mandate_chain,
