@@ -14,7 +14,7 @@ comments. A later commit does not take anything back. So never write any of thes
 
 Use placeholders (`https://board.example`, `/Users/you`, `runner-myproject`) and fake secrets that
 are obviously fake. If a task seems to need any of the above in the repo, stop and ask (`input_required`).
-The Runner's guard refuses a push or a PR that holds any of this. Build fake secrets at run time
+The Runner's guard (in the pact-runner repo) refuses a push or a PR that holds any of this. Build fake secrets at run time
 (`"sk-" + "ant-" + "x" * 24`) rather than writing them out, or mark the line `leak-ok`. CI runs
 gitleaks on every PR as well.
 
@@ -23,7 +23,6 @@ gitleaks on every PR as well.
 - `src/pact/`: the board, an MCP server (MCP SDK v2, psycopg 3), plus the Admin API at `/admin/api`
   and the `pact-admin` CLI. Schema changes are new numbered files in `src/pact/migrations/`; never
   edit one that has shipped.
-- `src/pact_runner/`: PACT Runner (headless `claude -p` per task), `pact-runner-guard` and `pact-connect`.
 - `tests/`: pytest against a real Postgres (`pact_test` by default, or `DATABASE_URL`).
 
 ## Checks
