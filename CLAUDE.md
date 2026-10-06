@@ -1,7 +1,19 @@
 # pact-board
 
-Read by Claude Code sessions in this repository, including PACT Runner sessions. This repo is
-public: keep it free of any one person's or company's names, hosts and secrets.
+Read by Claude Code sessions in this repository, including PACT Runner sessions.
+
+## This repository is public
+
+Everything here is public for good: files, commit messages, branch names, PR titles, bodies and
+comments. A later commit does not take anything back. So never write any of these into them:
+
+- tokens, keys, passwords, setup codes, webhook URLs or connection strings, even partial ones
+- the production hosts and URLs of a real deployment, or its account, team or project names
+- personal names, email addresses, home-directory paths (`/Users/<name>/…`) or machine details
+- board task ids, mandate ids, note contents or anything else copied from a private board or repo
+
+Use placeholders (`https://board.example`, `/Users/you`, `runner-myproject`) and fake secrets that
+are obviously fake. If a task seems to need any of the above in the repo, stop and ask (`input_required`).
 
 ## Layout
 
