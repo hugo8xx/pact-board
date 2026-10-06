@@ -14,6 +14,9 @@ comments. A later commit does not take anything back. So never write any of thes
 
 Use placeholders (`https://board.example`, `/Users/you`, `runner-myproject`) and fake secrets that
 are obviously fake. If a task seems to need any of the above in the repo, stop and ask (`input_required`).
+The Runner's guard refuses a push or a PR that holds any of this. Build fake secrets at run time
+(`"sk-" + "ant-" + "x" * 24`) rather than writing them out, or mark the line `leak-ok`. CI runs
+gitleaks on every PR as well.
 
 ## Layout
 

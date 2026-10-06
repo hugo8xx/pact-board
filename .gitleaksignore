@@ -1,0 +1,6 @@
+# Reviewed 2026-10-06: test fixtures, not secrets (a type name, a test signing key, a fake token).
+2a945035d304f38d575cbd10a2bdca7072109034:tests/credential_drivers.py:generic-api-key:42
+2a945035d304f38d575cbd10a2bdca7072109034:tests/credential_drivers.py:generic-api-key:73
+2a945035d304f38d575cbd10a2bdca7072109034:tests/credential_drivers.py:generic-api-key:117
+c0d904b74eab9f6dc558ea1e06c340249c4b7608:tests/conftest.py:generic-api-key:27
+c0d904b74eab9f6dc558ea1e06c340249c4b7608:tests/test_http.py:pact-token:94
