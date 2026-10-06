@@ -144,16 +144,18 @@ class Verifier:
 async def human_for(conn: Conn, verifier: Verifier, token: str, claims: dict[str, Any]) -> str | None:
     """The board human this sign-in belongs to. Matched by email once, then pinned by `sub`."""
     issuer = verifier.settings.issuer
-    row = await fetchone(conn, "SELECT id FROM humans WHERE auth_issuer = %s AND auth_sub = %s", (issuer, claims["sub"]))
+    row = await fetchone(
+        conn, "SELECT id, disabled_at FROM humans WHERE auth_issuer = %s AND auth_sub = %s", (issuer, claims["sub"])
+    )
     if row:
-        return str(row["id"])
+        return None if row["disabled_at"] else str(row["id"])
     email = await verifier.email_of(token, claims)
     if not email:
         return None
     row = await fetchone(
         conn,
         """UPDATE humans SET auth_issuer = %s, auth_sub = %s
-           WHERE lower(email) = lower(%s) AND auth_sub IS NULL RETURNING id""",
+           WHERE lower(email) = lower(%s) AND auth_sub IS NULL AND disabled_at IS NULL RETURNING id""",
         (issuer, claims["sub"], email),
     )
     return str(row["id"]) if row else None

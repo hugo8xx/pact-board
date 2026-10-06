@@ -85,9 +85,11 @@ class Admin:
         self.pool = pool
 
     async def _require(self, conn: Conn, human: str, role: Role) -> None:
-        row = await fetchone(conn, "SELECT role FROM humans WHERE id = %s", (human,))
+        row = await fetchone(conn, "SELECT role, disabled_at FROM humans WHERE id = %s", (human,))
         if row is None:
             raise PactError("forbidden", f"{human} is not a registered human")
+        if row["disabled_at"] is not None:
+            raise PactError("forbidden", f"{human} is disabled")
         if _RANK[row["role"]] < _RANK[role]:
             raise PactError("forbidden", f"{human} is {row['role']}; this needs {role}")
 
@@ -133,6 +135,61 @@ class Admin:
                 "INSERT INTO humans (id, name, role, email) VALUES (%s, %s, %s, %s)", (human_id, name, role, email)
             )
             await self._log(conn, by or human_id, "admin.human.add", {"id": human_id, "role": role, "email": email})
+
+    async def update_human(
+        self,
+        human_id: str,
+        *,
+        by: str,
+        name: str | None = None,
+        email: str | None = None,
+        role: Role | None = None,
+        disabled: bool | None = None,
+    ) -> dict[str, Any]:
+        """Change a person's name, email or role, or disable them. A new email unpins their sign-in,
+        so the next sign-in with that email binds again. The board always keeps one active owner."""
+        if role is not None and role not in _RANK:
+            raise PactError("invalid_request", f"role must be one of {', '.join(_RANK)}")
+        if name is not None and not name.strip():
+            raise PactError("invalid_request", "a person needs a name")
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "owner")
+            row = await fetchone(conn, "SELECT id, role, email, disabled_at FROM humans WHERE id = %s FOR UPDATE", (human_id,))
+            if row is None:
+                raise PactError("not_found", f"{human_id} is not a registered person")
+            stays_owner = (role or row["role"]) == "owner" and not (disabled if disabled is not None else row["disabled_at"])
+            if row["role"] == "owner" and row["disabled_at"] is None and not stays_owner:
+                others = await fetchone(
+                    conn,
+                    "SELECT count(*) AS n FROM humans WHERE role = 'owner' AND disabled_at IS NULL AND id <> %s",
+                    (human_id,),
+                )
+                if not others or others["n"] == 0:
+                    raise PactError("invalid_request", "the board needs at least one active owner; make someone else owner first")
+            new_email = (email.strip() or None) if email is not None else row["email"]
+            await conn.execute(
+                """UPDATE humans SET name = COALESCE(%s, name), role = COALESCE(%s, role), email = %s,
+                     auth_issuer = CASE WHEN %s::boolean THEN NULL ELSE auth_issuer END,
+                     auth_sub = CASE WHEN %s::boolean THEN NULL ELSE auth_sub END,
+                     disabled_at = CASE WHEN %s::boolean IS NULL THEN disabled_at
+                                        WHEN %s::boolean THEN COALESCE(disabled_at, now()) ELSE NULL END
+                   WHERE id = %s""",
+                (
+                    name.strip() if name else None,
+                    role,
+                    new_email,
+                    new_email != row["email"],
+                    new_email != row["email"],
+                    disabled,
+                    disabled,
+                    human_id,
+                ),
+            )
+            change = {"name": name, "email": email, "role": role, "disabled": disabled}
+            await self._log(
+                conn, by, "admin.human.update", {"id": human_id, **{k: v for k, v in change.items() if v is not None}}
+            )
+            return {"ok": True, "id": human_id}
 
     async def add_project(self, project_id: str, name: str, *, by: str, production: bool = False) -> None:
         async with transaction(self.pool) as conn:
@@ -799,63 +856,106 @@ class Admin:
             return {"agent_id": agent_id, "mandate_id": mandate.id, "expires_at": iso(mandate.expires_at)}
 
     async def change_role(self, agent_id: str, role_id: str, *, by: str) -> dict[str, Any]:
-        """Move an agent to another role of its client. It gets a new root mandate from that role at
-        once, and every root mandate it held before is revoked, so the old role's wider rights do not
-        linger until they expire; open tasks under them stop. Its tokens and connection stay."""
+        return await self.update_agent(agent_id, by=by, role_id=role_id)
+
+    async def update_agent(
+        self,
+        agent_id: str,
+        *,
+        by: str,
+        role_id: str | None = None,
+        owner: str | None = None,
+        projects: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Change an agent's role, projects or owner. Its id and client never change (the log and
+        its mandates name it; replace the agent instead).
+
+        A new role or new projects reissue its root mandate from the role at once and revoke every
+        root mandate it held before, so old rights do not linger until they expire; open tasks
+        under them stop. A new owner changes nothing else. Tokens and connection stay."""
         async with transaction(self.pool) as conn:
             await self._require(conn, by, "approver")
             agent = await fetchone(
-                conn,
-                """SELECT a.id, a.client, a.status, a.role_id, (SELECT project_id FROM agent_projects p
-                   WHERE p.agent_id = a.id ORDER BY project_id LIMIT 1) AS project FROM agents a WHERE a.id = %s""",
-                (agent_id,),
+                conn, "SELECT id, client, status, role_id, owner FROM agents WHERE id = %s FOR UPDATE", (agent_id,)
             )
             if agent is None or agent["status"] == "banned":
                 raise PactError("not_found", f"agent {agent_id} does not exist or is banned")
-            role = await self._role(conn, role_id)
-            if role["archived_at"]:
-                raise PactError("invalid_request", f"role {role_id} is archived")
-            if role["client"] != agent["client"]:
-                raise PactError(
-                    "invalid_request", f"role {role_id} is for {role['client']} agents; {agent_id} is a {agent['client']} agent"
+            current = [p.id for p in await agent_projects(conn, agent_id)]
+            if owner is not None and owner != agent["owner"]:
+                who = await fetchone(conn, "SELECT disabled_at FROM humans WHERE id = %s", (owner,))
+                if who is None or who["disabled_at"] is not None:
+                    raise PactError("not_found", f"{owner} is not an active registered person")
+                await conn.execute("UPDATE agents SET owner = %s WHERE id = %s", (owner, agent_id))
+            new_projects = sorted(set(projects)) if projects is not None else current
+            reissue = (role_id is not None and role_id != agent["role_id"]) or (sorted(new_projects) != sorted(current))
+            out: dict[str, Any] = {"agent_id": agent_id, "role": role_id or agent["role_id"], "owner": owner or agent["owner"]}
+            if reissue:
+                rid = role_id or agent["role_id"]
+                if not rid:
+                    raise PactError("invalid_request", f"agent {agent_id} has no role; give it one first")
+                role = await self._role(conn, rid)
+                if role["archived_at"]:
+                    raise PactError("invalid_request", f"role {rid} is archived")
+                if role["client"] != agent["client"]:
+                    raise PactError(
+                        "invalid_request", f"role {rid} is for {role['client']} agents; {agent_id} is a {agent['client']} agent"
+                    )
+                if not new_projects:
+                    raise PactError("project_required", "an agent needs at least one project")
+                if agent["client"] in ("code", "runner") and len(new_projects) != 1:
+                    raise PactError("invalid_request", f"a {agent['client']} agent belongs to exactly one project")
+                for p in new_projects:
+                    row = await fetchone(conn, "SELECT production FROM projects WHERE id = %s", (p,))
+                    if row is None:
+                        raise PactError("not_found", f"project {p} does not exist")
+                    if agent["client"] == "runner" and row["production"]:
+                        raise PactError("project_mismatch", f"project {p} is production; a Runner may not work on it")
+                old = await fetchall(
+                    conn,
+                    """SELECT id FROM mandates WHERE holder = %s AND parent_id IS NULL AND revoked_at IS NULL
+                       AND expires_at > now()""",
+                    (agent_id,),
                 )
-            old = await fetchall(
-                conn,
-                """SELECT id FROM mandates WHERE holder = %s AND parent_id IS NULL AND revoked_at IS NULL
-                   AND expires_at > now()""",
-                (agent_id,),
-            )
-            mandate = await issue_root(
-                conn,
-                human=by,
-                holder=agent_id,
-                scope=role_scope(list(role["actions"]), agent["project"]),
-                limits={k: float(v) for k, v in role["limits"].items()},
-                delegations=role["delegations"],
-                expires_at=datetime.now(UTC) + timedelta(days=float(role["mandate_days"])),
-            )
-            await conn.execute(
-                "UPDATE agents SET role_id = %s, root_mandate_id = %s WHERE id = %s", (role_id, mandate.id, agent_id)
-            )
-            stopped: list[Any] = []
-            for row in old:
-                stopped += (await revoke_subtree(conn, str(row["id"])))["stopped"]
-            await revoke_closed_task_mandates(conn, [tid for tid, _ in stopped])
+                await conn.execute("DELETE FROM agent_projects WHERE agent_id = %s", (agent_id,))
+                for p in new_projects:
+                    await conn.execute("INSERT INTO agent_projects (agent_id, project_id) VALUES (%s, %s)", (agent_id, p))
+                mandate = await issue_root(
+                    conn,
+                    human=by,
+                    holder=agent_id,
+                    scope=[s for p in new_projects for s in role_scope(list(role["actions"]), p)],
+                    limits={k: float(v) for k, v in role["limits"].items()},
+                    delegations=role["delegations"],
+                    expires_at=datetime.now(UTC) + timedelta(days=float(role["mandate_days"])),
+                )
+                await conn.execute(
+                    "UPDATE agents SET role_id = %s, root_mandate_id = %s WHERE id = %s", (rid, mandate.id, agent_id)
+                )
+                stopped: list[Any] = []
+                for row in old:
+                    stopped += (await revoke_subtree(conn, str(row["id"])))["stopped"]
+                await revoke_closed_task_mandates(conn, [tid for tid, _ in stopped])
+                out |= {
+                    "role": rid,
+                    "projects": new_projects,
+                    "mandate_id": mandate.id,
+                    "expires_at": iso(mandate.expires_at),
+                    "revoked_mandates": len(old),
+                    "tasks_stopped": len(stopped),
+                }
             await self._log(
                 conn,
                 by,
-                "admin.agent.role",
-                {"agent": agent_id, "from": agent["role_id"], "to": role_id, "revoked": [str(r["id"]) for r in old]},
-                mandate_chain=[mandate.id],
+                "admin.agent.update",
+                {
+                    "agent": agent_id,
+                    "role": [agent["role_id"], out["role"]],
+                    "owner": [agent["owner"], out["owner"]],
+                    "projects": [current, new_projects],
+                },
+                mandate_chain=[out["mandate_id"]] if "mandate_id" in out else None,
             )
-            return {
-                "agent_id": agent_id,
-                "role": role_id,
-                "mandate_id": mandate.id,
-                "expires_at": iso(mandate.expires_at),
-                "revoked_mandates": len(old),
-                "tasks_stopped": len(stopped),
-            }
+            return out
 
     async def set_halted(self, halted: bool, *, by: str) -> None:
         async with transaction(self.pool) as conn:
@@ -892,6 +992,28 @@ class Admin:
             if row is None:
                 raise PactError("invalid_request", f"task {task_id} is not deferred")
             await self._log(conn, by, "admin.task.resume", {"answer": answer}, project_id=row["project_id"], task_id=task_id)
+
+    async def edit_task(self, task_id: str, *, by: str, title: str | None = None, body: str | None = None) -> dict[str, Any]:
+        """Correct an open task's title or body. The agent working on it sees the new text on its
+        next pact_list; the log keeps what it said before."""
+        if title is not None and not title.strip():
+            raise PactError("invalid_request", "a task needs a title")
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            row = await self._open_task(conn, task_id)
+            await conn.execute(
+                "UPDATE tasks SET title = COALESCE(%s, title), body = COALESCE(%s, body) WHERE id = %s",
+                (title.strip() if title else None, body, row["id"]),
+            )
+            await self._log(
+                conn,
+                by,
+                "admin.task.edit",
+                {"was": {"title": row["title"], "body": row["body"]}, "title": title, "body": body},
+                project_id=row["project_id"],
+                task_id=str(row["id"]),
+            )
+            return {"ok": True}
 
     async def _open_task(self, conn: Conn, task_id: str) -> dict[str, Any]:
         """Lock a task a person is about to change; closed tasks are left as they ended."""
