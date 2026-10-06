@@ -264,6 +264,12 @@ cannot push to anyone. One process per runner agent, on a machine that has a log
      settings, permissions or hooks. A missing file is skipped.
    - A PreToolUse guard (`pact-runner-guard`) refuses pushes to `main`/`master`/`stage`/`staging`/`release`,
      force pushes and `gh pr merge`. Branch protection on the host is still the hard stop.
+   - The same guard reads what a push or a `gh pr|issue|release|gist` write would publish: every
+     outgoing commit (message and added lines) and the PR or comment text, including a body file.
+     It refuses secrets (API keys, tokens, private keys, passwords in URLs), this machine's home path
+     and any word in `PACT_RUNNER_DENY_FILE` (one per line: real hosts, names, emails). On a public
+     repository these would be public for good. A line with an obviously fake test value can carry
+     `leak-ok`.
    - The board as an MCP server, minus `pact_claim`/`pact_report`/`pact_defer`/`pact_revoke`. The session
      answers through `--json-schema` structured output (`completed`, `failed`, `input_required` or
      `defer`), and the Runner reports for it with `usage={"turns": n}`.
