@@ -162,6 +162,44 @@ async def test_renewing_issues_a_fresh_mandate_from_the_role(world: World) -> No
     await refused(world.admin.renew("old-web", by="boss"), "invalid_request")  # not hired into a role
 
 
+async def test_changing_role_reissues_the_mandate_and_revokes_the_old_one(world: World) -> None:
+    await world.project("web")
+    await world.admin.save_role(
+        "reviewer",
+        {
+            "name": "Reviewer",
+            "client": "gemini",
+            "actions": ["task.read", "task.work"],
+            "delegations": 0,
+            "instructions": "Review only.",
+        },
+        by="boss",
+    )
+    await world.admin.hire("gemini", "web", by="boss", agent_id="gemini-web")
+    async with transaction(world.pool) as conn:
+        agent = await get_agent(conn, "gemini-web")
+        old = await fetchone(conn, "SELECT root_mandate_id FROM agents WHERE id = 'gemini-web'")
+    assert agent and old
+    task = await world.board.post(agent, project_id="web", title="something", mandate_id=str(old["root_mandate_id"]))
+
+    out = await world.admin.change_role("gemini-web", "reviewer", by="boss")
+    assert out["role"] == "reviewer" and out["revoked_mandates"] == 1 and out["tasks_stopped"] == 1
+    m = await mandate_of(world, "gemini-web")
+    assert sorted(m["scope"]) == ["task.read@project:web", "task.work@project:web"] and m["delegations_left"] == 0
+    async with transaction(world.pool) as conn:
+        gone = await fetchone(conn, "SELECT revoked_at FROM mandates WHERE id = %s", (old["root_mandate_id"],))
+        stopped = await fetchone(conn, "SELECT status FROM tasks WHERE id = %s", (task["task_id"],))
+    assert gone and gone["revoked_at"] is not None and stopped and stopped["status"] == "canceled"
+    assert (await world.board.whoami(agent))["agent"]["role"]["instructions"] == "Review only."
+
+    await refused(world.admin.change_role("gemini-web", "runner", by="boss"), "invalid_request")  # another client
+    await world.admin.archive_role("gemini", by="boss")
+    await refused(world.admin.change_role("gemini-web", "gemini", by="boss"), "invalid_request")  # archived
+    await refused(world.admin.change_role("nobody", "reviewer", by="boss"), "not_found")
+    await world.admin.add_human("vic", "Vic", "viewer", by="boss")
+    await refused(world.admin.change_role("gemini-web", "reviewer", by="vic"), "forbidden")
+
+
 async def test_a_replaced_agent_points_to_its_successor(world: World) -> None:
     await world.project("web")
     await world.admin.hire("chat", "web", by="boss", agent_id="pact-chat")

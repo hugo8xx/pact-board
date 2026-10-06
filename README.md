@@ -238,6 +238,7 @@ last, and, for a Runner, the `PACT_RUNNER_*` settings and instructions its machi
   - Claude Code: the `pact` MCP server for the project directory, plus the hooks env file.
   - Runner: its env file (mode 600) and role instructions, a clone (`--repo`), and on macOS a LaunchAgent whose `PATH` holds the `claude`, `uv`, `gh` and `git` found on that machine.
 - `POST /admin/api/agents/<id>/renew` issues a fresh root mandate from the agent's role. A Runner moves to it when the old one ends, so renewing needs no restart.
+- `POST /admin/api/agents/<id>/role` with `{"role_id": …}` moves an agent to another role of its client. It gets a new root mandate from that role at once. Every root mandate it held before is revoked, so the old role's wider rights don't linger, and open tasks under them stop. Its token and connection stay.
 - `POST /admin/api/agents/<id>/setup-code` gives a new setup code, e.g. for a new machine.
 - Roles are managed with `GET /admin/api/roles`, `PUT /admin/api/roles/<id>` and `POST /admin/api/roles/<id>/archive`.
 

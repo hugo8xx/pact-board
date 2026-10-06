@@ -458,6 +458,10 @@ class AdminApi:
     async def renew(self, request: Request, human: str) -> Any:
         return await self.admin.renew(request.path_params["agent_id"], by=human)
 
+    async def change_role(self, request: Request, human: str) -> Any:
+        b = await _body(request)
+        return await self.admin.change_role(request.path_params["agent_id"], str(b.get("role_id") or ""), by=human)
+
     async def setup_code(self, request: Request, human: str) -> Any:
         return await self.admin.setup_code(request.path_params["agent_id"], by=human)
 
@@ -584,6 +588,7 @@ def build_admin_app(pool: AsyncConnectionPool[Conn], verifier: Verifier) -> Star
             Route(f"{p}/agents/hire", r(a.hire), methods=["POST"]),
             Route(f"{p}/agents/{{agent_id}}/connection", r(a.agent_connection)),
             Route(f"{p}/agents/{{agent_id}}/renew", r(a.renew), methods=["POST"]),
+            Route(f"{p}/agents/{{agent_id}}/role", r(a.change_role), methods=["POST"]),
             Route(f"{p}/agents/{{agent_id}}/setup-code", r(a.setup_code), methods=["POST"]),
             Route(f"{p}/roles", r(a.roles)),
             Route(f"{p}/roles/{{role_id}}", r(a.save_role), methods=["PUT"]),

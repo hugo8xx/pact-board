@@ -798,6 +798,65 @@ class Admin:
             await self._log(conn, by, "admin.agent.renew", {"agent": agent_id, "role": role["id"]}, mandate_chain=[mandate.id])
             return {"agent_id": agent_id, "mandate_id": mandate.id, "expires_at": iso(mandate.expires_at)}
 
+    async def change_role(self, agent_id: str, role_id: str, *, by: str) -> dict[str, Any]:
+        """Move an agent to another role of its client. It gets a new root mandate from that role at
+        once, and every root mandate it held before is revoked, so the old role's wider rights do not
+        linger until they expire; open tasks under them stop. Its tokens and connection stay."""
+        async with transaction(self.pool) as conn:
+            await self._require(conn, by, "approver")
+            agent = await fetchone(
+                conn,
+                """SELECT a.id, a.client, a.status, a.role_id, (SELECT project_id FROM agent_projects p
+                   WHERE p.agent_id = a.id ORDER BY project_id LIMIT 1) AS project FROM agents a WHERE a.id = %s""",
+                (agent_id,),
+            )
+            if agent is None or agent["status"] == "banned":
+                raise PactError("not_found", f"agent {agent_id} does not exist or is banned")
+            role = await self._role(conn, role_id)
+            if role["archived_at"]:
+                raise PactError("invalid_request", f"role {role_id} is archived")
+            if role["client"] != agent["client"]:
+                raise PactError(
+                    "invalid_request", f"role {role_id} is for {role['client']} agents; {agent_id} is a {agent['client']} agent"
+                )
+            old = await fetchall(
+                conn,
+                """SELECT id FROM mandates WHERE holder = %s AND parent_id IS NULL AND revoked_at IS NULL
+                   AND expires_at > now()""",
+                (agent_id,),
+            )
+            mandate = await issue_root(
+                conn,
+                human=by,
+                holder=agent_id,
+                scope=role_scope(list(role["actions"]), agent["project"]),
+                limits={k: float(v) for k, v in role["limits"].items()},
+                delegations=role["delegations"],
+                expires_at=datetime.now(UTC) + timedelta(days=float(role["mandate_days"])),
+            )
+            await conn.execute(
+                "UPDATE agents SET role_id = %s, root_mandate_id = %s WHERE id = %s", (role_id, mandate.id, agent_id)
+            )
+            stopped: list[Any] = []
+            for row in old:
+                stopped += (await revoke_subtree(conn, str(row["id"])))["stopped"]
+            await revoke_closed_task_mandates(conn, [tid for tid, _ in stopped])
+            await self._log(
+                conn,
+                by,
+                "admin.agent.role",
+                {"agent": agent_id, "from": agent["role_id"], "to": role_id, "revoked": [str(r["id"]) for r in old]},
+                mandate_chain=[mandate.id],
+            )
+            return {
+                "agent_id": agent_id,
+                "role": role_id,
+                "mandate_id": mandate.id,
+                "expires_at": iso(mandate.expires_at),
+                "revoked_mandates": len(old),
+                "tasks_stopped": len(stopped),
+            }
+
     async def set_halted(self, halted: bool, *, by: str) -> None:
         async with transaction(self.pool) as conn:
             await self._require(conn, by, "owner")
