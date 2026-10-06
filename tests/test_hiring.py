@@ -54,6 +54,34 @@ async def test_hiring_gemini_gives_a_setup_code_like_claude_code(world: World) -
     assert "context.write@project:web" in m["scope"] and m["delegations_left"] == 3
 
 
+async def test_whoami_hands_the_agent_its_role_and_instructions(world: World) -> None:
+    """Only a Runner gets its role's instructions from pact-connect; every other agent reads them here."""
+    await world.project("web")
+    await world.admin.save_role(
+        "reviewer",
+        {
+            "name": "Reviewer",
+            "description": "Reviews from outside the team.",
+            "client": "gemini",
+            "actions": ["task.read", "task.work"],
+            "delegations": 0,
+            "instructions": "Review only. Never edit code.",
+        },
+        by="boss",
+    )
+    await world.admin.hire("reviewer", "web", by="boss", agent_id="gemini-web")
+    async with transaction(world.pool) as conn:
+        agent = await get_agent(conn, "gemini-web")
+    assert agent
+    me = (await world.board.whoami(agent))["agent"]
+    assert me["role"] == {
+        "id": "reviewer",
+        "name": "Reviewer",
+        "description": "Reviews from outside the team.",
+        "instructions": "Review only. Never edit code.",
+    }
+
+
 async def test_hiring_chat_gives_a_connector_url_and_no_token(world: World) -> None:
     await world.project("web")
     out = await world.admin.hire("chat", "web", by="boss")
