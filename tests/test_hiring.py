@@ -36,13 +36,22 @@ async def mandate_of(w: World, agent_id: str) -> dict[str, Any]:
     return dict(row)
 
 
-async def test_the_board_starts_with_seven_roles(world: World) -> None:
+async def test_the_board_starts_with_eight_roles(world: World) -> None:
     roles = {r["id"]: r for r in await world.admin.list_roles()}
-    assert list(roles) == ["chat", "code", "runner", "worker", "secretary", "design", "cowork"]
+    assert list(roles) == ["chat", "code", "gemini", "runner", "worker", "secretary", "design", "cowork"]
     assert roles["runner"]["client"] == "runner" and roles["runner"]["limits"] == {"runs": 50, "turns": 2000}
     assert roles["secretary"]["actions"] == ["task.read", "task.post", "report.brief"]
     schedule = json.loads(roles["secretary"]["settings"]["PACT_RUNNER_SCHEDULE"])
     assert schedule[0]["action"] == "report.brief" and "{since}" in schedule[0]["body"]
+
+
+async def test_hiring_gemini_gives_a_setup_code_like_claude_code(world: World) -> None:
+    await world.project("web")
+    out = await world.admin.hire("gemini", "web", by="boss")
+    assert out["agent_id"] == "gemini-web" and out["connect"]["kind"] == "setup_code"
+    assert out["connect"]["command"].startswith("pact-connect ") and "token" not in out["connect"]
+    m = await mandate_of(world, "gemini-web")
+    assert "context.write@project:web" in m["scope"] and m["delegations_left"] == 3
 
 
 async def test_hiring_chat_gives_a_connector_url_and_no_token(world: World) -> None:
