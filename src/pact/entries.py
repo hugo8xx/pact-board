@@ -12,6 +12,8 @@ from .db import Conn, fetchall, fetchone
 from .redact import redact
 
 SYSTEM_CHAIN = "_system"
+DEFAULT_ORG = "default"
+"""The organization a single-organization board's data moved into (migration 019)."""
 GENESIS = "0" * 64
 
 
@@ -27,10 +29,25 @@ class EntryInput:
     payload: Any
     outcome: str
     """``ok`` or an error code."""
+    org_id: str | None = None
+    """The organization, when neither the project nor the agent says it (a person's own action)."""
 
 
 def _entry_hash(fields: dict[str, Any]) -> str:
     return sha256(canonical_json(fields))
+
+
+async def _org_of(conn: Conn, e: EntryInput) -> str:
+    """The organization an entry belongs to: its project's, else its agent's, else the one given."""
+    if e.project_id:
+        row = await fetchone(conn, "SELECT org_id FROM projects WHERE id = %s", (e.project_id,))
+        if row:
+            return str(row["org_id"])
+    if e.agent_id:
+        row = await fetchone(conn, "SELECT org_id FROM agents WHERE id = %s", (e.agent_id,))
+        if row:
+            return str(row["org_id"])
+    return e.org_id or DEFAULT_ORG
 
 
 async def append_entry(conn: Conn, e: EntryInput) -> tuple[int, str]:
@@ -39,7 +56,12 @@ async def append_entry(conn: Conn, e: EntryInput) -> tuple[int, str]:
     The payload is redacted and stored apart (so it can be erased on request); only its hash
     enters the chain. Chains are per project, so projects never queue behind each other.
     """
-    chain_key = e.project_id or SYSTEM_CHAIN
+    org = await _org_of(conn, e)
+    if e.project_id:
+        chain_key = e.project_id
+    else:
+        row = await fetchone(conn, "SELECT system_chain FROM orgs WHERE id = %s", (org,))
+        chain_key = row["system_chain"] if row else SYSTEM_CHAIN
     content = redact(e.payload)
     payload_hash = sha256(canonical_json(content))
     payload_id = str(uuid4())
@@ -69,8 +91,8 @@ async def append_entry(conn: Conn, e: EntryInput) -> tuple[int, str]:
     row = await fetchone(
         conn,
         """INSERT INTO entries (chain_key, project_id, task_id, agent_id, actor, mandate_chain, action, payload_hash,
-                                payload_ref, outcome, at, prev_hash, hash)
-           VALUES (%s, %s, %s, %s, %s, %s::uuid[], %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                                payload_ref, outcome, at, prev_hash, hash, org_id)
+           VALUES (%s, %s, %s, %s, %s, %s::uuid[], %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
         (
             chain_key,
             e.project_id,
@@ -85,6 +107,7 @@ async def append_entry(conn: Conn, e: EntryInput) -> tuple[int, str]:
             at,
             prev_hash,
             entry_hash,
+            org,
         ),
     )
     await conn.execute("UPDATE entry_chain_heads SET last_hash = %s WHERE chain_key = %s", (entry_hash, chain_key))

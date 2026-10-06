@@ -96,6 +96,11 @@ async def world() -> AsyncIterator[World]:
         await conn.execute(f"TRUNCATE {TABLES} CASCADE")
         await conn.execute("ALTER TABLE entries ENABLE TRIGGER entries_no_update")
         await conn.execute("UPDATE system_state SET halted = false")
+        # Organizations other than the default one, and what only they own, go too.
+        await conn.execute("DELETE FROM agent_roles WHERE org_id <> 'default'")
+        await conn.execute("DELETE FROM approval_actions WHERE org_id <> 'default'")
+        await conn.execute("DELETE FROM orgs WHERE id <> 'default'")
+        await conn.execute("UPDATE orgs SET halted = false")
     admin = Admin(pool)
     await admin.add_human("boss", "Boss", "owner")
     yield World(pool=pool, admin=admin, board=Board(pool))

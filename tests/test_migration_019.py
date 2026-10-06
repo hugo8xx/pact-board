@@ -3,6 +3,7 @@ changing anything a person or agent sees, and keeps every existing log chain ver
 
 import os
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 
 import psycopg
 import pytest
@@ -32,19 +33,60 @@ async def old_board() -> AsyncIterator[object]:
         conn.execute(f"DROP SCHEMA {SCHEMA} CASCADE")
 
 
+async def _old_entry(conn: object, chain_key: str, project_id: str | None, action: str) -> None:
+    """Append an entry the way the release before organizations did (no org_id column yet)."""
+    from uuid import uuid4
+
+    from psycopg.types.json import Jsonb
+
+    from pact.crypto import canonical_json, iso, sha256
+    from pact.entries import GENESIS, _entry_hash
+
+    c = conn  # type: ignore[assignment]
+    head = await fetchone(c, "SELECT last_hash FROM entry_chain_heads WHERE chain_key = %s", (chain_key,))  # type: ignore[arg-type]
+    prev = head["last_hash"] if head else GENESIS
+    payload, pid, at = {"x": 1}, str(uuid4()), datetime.now(UTC)
+    phash = sha256(canonical_json(payload))
+    fields = {
+        "chain_key": chain_key,
+        "project_id": project_id,
+        "task_id": None,
+        "agent_id": None,
+        "actor": "human:boss",
+        "mandate_chain": [],
+        "action": action,
+        "payload_hash": phash,
+        "outcome": "ok",
+        "at": iso(at),
+        "prev_hash": prev,
+    }
+    h = _entry_hash(fields)
+    await c.execute("INSERT INTO payloads (id, content) VALUES (%s, %s)", (pid, Jsonb(payload)))  # type: ignore[attr-defined]
+    await c.execute(  # type: ignore[attr-defined]
+        """INSERT INTO entries (chain_key, project_id, actor, action, payload_hash, payload_ref, outcome, at, prev_hash, hash)
+           VALUES (%s, %s, 'human:boss', %s, %s, %s, 'ok', %s, %s, %s)""",
+        (chain_key, project_id, action, phash, pid, at, prev, h),
+    )
+    await c.execute(  # type: ignore[attr-defined]
+        """INSERT INTO entry_chain_heads (chain_key, last_hash) VALUES (%s, %s)
+           ON CONFLICT (chain_key) DO UPDATE SET last_hash = EXCLUDED.last_hash""",
+        (chain_key, h),
+    )
+
+
 async def test_an_existing_board_moves_into_the_default_organization(old_board: object) -> None:
     pool = old_board
-    admin = Admin(pool)  # type: ignore[arg-type]
-    await admin.add_human("boss", "Boss", "owner")
-    await admin.add_project("web", "Web", by="boss")
-    out = await admin.register_agent("code-web", by="boss", client="code", projects=["web"])
-    await admin.set_halted(False, by="boss")  # an entry on the _system chain
     async with transaction(pool) as conn:  # type: ignore[arg-type]
-        # The way the previous release stored a role (before roles had an organization).
+        # The data the previous release left behind, written the way it wrote it.
+        await conn.execute("INSERT INTO humans (id, name, role) VALUES ('boss', 'Boss', 'owner')")
+        await conn.execute("INSERT INTO projects (id, name, created_by) VALUES ('web', 'Web', 'boss')")
         await conn.execute(
             "INSERT INTO agent_roles (id, name, client, actions) VALUES ('reviewer', 'Reviewer', 'code', '{task.read}')"
         )
-        await conn.execute("UPDATE agents SET role_id = 'reviewer' WHERE id = 'code-web'")
+        await conn.execute("INSERT INTO agents (id, owner, client, role_id) VALUES ('code-web', 'boss', 'code', 'reviewer')")
+        await conn.execute("INSERT INTO agent_projects (agent_id, project_id) VALUES ('code-web', 'web')")
+        for chain, project in (("_system", None), ("web", "web"), ("web", "web"), ("_system", None)):
+            await _old_entry(conn, chain, project, "test.action")
 
     assert await migrate(pool) == ["019_orgs.sql"]  # type: ignore[arg-type]
 
@@ -54,17 +96,16 @@ async def test_an_existing_board_moves_into_the_default_organization(old_board: 
         for table in ("humans", "projects", "agents", "agent_roles", "approval_actions", "entries", "agent_projects"):
             rows = await fetchall(conn, f"SELECT DISTINCT org_id FROM {table}")
             assert [r["org_id"] for r in rows] == ["default"], table
-        # Every chain written before the migration still verifies.
-        chains = await fetchall(conn, "SELECT chain_key FROM entry_chain_heads")
-        assert {c["chain_key"] for c in chains} >= {"_system", "web"}
-        for c in chains:
-            assert (await verify_entry_chain(conn, c["chain_key"])).ok, c["chain_key"]
-        # Roles keep working: the agent's role, a new role, and the shipped templates for new orgs.
+        for chain in ("_system", "web"):
+            assert (await verify_entry_chain(conn, chain)).ok, chain
         assert (await fetchone(conn, "SELECT role_id FROM agents WHERE id = 'code-web'")) == {"role_id": "reviewer"}
         templates = await fetchall(conn, "SELECT id FROM role_templates ORDER BY position")
         assert [t["id"] for t in templates] == ["chat", "code", "gemini", "runner", "worker", "secretary", "design", "cowork"]
+    # The new release keeps writing to the same chains, and they still verify.
+    admin = Admin(pool)  # type: ignore[arg-type]
+    await admin.set_halted(False, by="boss")
     await admin.save_role("reviewer", {"name": "Reviewer 2", "client": "code", "actions": ["task.read"]}, by="boss")
-    assert out["root_mandate_id"]
+    assert all(v["ok"] for v in await admin.verify_log("default"))
 
 
 async def test_an_agent_cannot_join_a_project_of_another_organization(old_board: object) -> None:

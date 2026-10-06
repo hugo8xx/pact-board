@@ -37,7 +37,7 @@ async def mandate_of(w: World, agent_id: str) -> dict[str, Any]:
 
 
 async def test_the_board_starts_with_eight_roles(world: World) -> None:
-    roles = {r["id"]: r for r in await world.admin.list_roles()}
+    roles = {r["id"]: r for r in await world.admin.list_roles("default")}
     assert list(roles) == ["chat", "code", "gemini", "runner", "worker", "secretary", "design", "cowork"]
     assert roles["runner"]["client"] == "runner" and roles["runner"]["limits"] == {"runs": 50, "turns": 2000}
     assert roles["secretary"]["actions"] == ["task.read", "task.post", "report.brief"]
@@ -126,7 +126,7 @@ async def test_an_expired_or_unknown_code_is_refused(world: World) -> None:
 async def test_names_are_checked(world: World) -> None:
     await world.project("web")
     await world.admin.hire("chat", "web", by="boss")
-    await refused(world.admin.hire("chat", "web", by="boss"), "invalid_request")  # chat-web exists
+    await refused(world.admin.hire("chat", "web", by="boss"), "id_taken")  # chat-web exists
     await refused(world.admin.hire("chat", "web", by="boss", agent_id="Chat Web"), "invalid_request")
     assert (await world.admin.hire("chat", "web", by="boss", agent_id="chat-web-2"))["agent_id"] == "chat-web-2"
     await refused(world.admin.hire("nope", "web", by="boss"), "not_found")
@@ -146,7 +146,7 @@ async def test_roles_are_edited_and_checked(world: World) -> None:
     ):
         await refused(world.admin.save_role("marketer", bad, by="boss"), "invalid_request")
     await world.admin.archive_role("marketer", by="boss")
-    assert "marketer" not in {r["id"] for r in await world.admin.list_roles()}
+    assert "marketer" not in {r["id"] for r in await world.admin.list_roles("default")}
     await refused(world.admin.hire("marketer", "web", by="boss", agent_id="m2"), "invalid_request")
 
 

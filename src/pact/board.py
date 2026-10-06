@@ -151,7 +151,8 @@ class Board:
             async with transaction(self.pool) as conn:
                 gate = await fetchone(
                     conn,
-                    "SELECT s.halted, a.status, a.replaced_by FROM system_state s, agents a WHERE a.id = %s",
+                    """SELECT s.halted OR o.halted AS halted, a.status, a.replaced_by
+                       FROM system_state s, agents a JOIN orgs o ON o.id = a.org_id WHERE a.id = %s""",
                     (agent.id,),
                 )
                 if gate is None:

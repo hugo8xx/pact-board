@@ -27,7 +27,7 @@ from .board import (
 )
 from .crypto import iso, new_token, sha256
 from .db import Conn, fetchall, fetchone, transaction
-from .entries import SYSTEM_CHAIN, EntryInput, append_entry, erase_payload, verify_entry_chain
+from .entries import DEFAULT_ORG, SYSTEM_CHAIN, EntryInput, append_entry, erase_payload, verify_entry_chain
 from .errors import PactError
 from .keys import b64url, b64url_decode, public_key_from_text
 from .mandates import MAX_DEPTH, ImportedLink, Limits, get_mandate, issue_root, revoke_impact, revoke_subtree
@@ -35,6 +35,20 @@ from .scope import board_scope, is_valid_scope
 
 Role = Literal["owner", "approver", "viewer"]
 _RANK: dict[str, int] = {"viewer": 0, "approver": 1, "owner": 2}
+
+# How to tell that a row a person names belongs to their organization. Anything else answers
+# not_found with the same words as a row that does not exist, so ids of other organizations
+# cannot be probed.
+_IN_ORG: dict[str, str] = {
+    "agent": "SELECT 1 FROM agents WHERE id = %s AND org_id = %s",
+    "project": "SELECT 1 FROM projects WHERE id = %s AND org_id = %s",
+    "human": "SELECT 1 FROM humans WHERE id = %s AND org_id = %s",
+    "task": "SELECT 1 FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id::text = %s AND p.org_id = %s",
+    "mandate": "SELECT 1 FROM mandates m JOIN agents a ON a.id = m.holder WHERE m.id::text = %s AND a.org_id = %s",
+    "entry": "SELECT 1 FROM entries WHERE id = %s AND org_id = %s",
+    "note version": """SELECT 1 FROM context_note_versions v JOIN projects p ON p.id = v.project_id
+                       WHERE v.id = %s AND p.org_id = %s""",
+}
 
 DEFAULT_MANDATE_DAYS = 30
 DEFAULT_TOKEN_DAYS = 30
@@ -84,14 +98,20 @@ class Admin:
     def __init__(self, pool: AsyncConnectionPool[Conn]) -> None:
         self.pool = pool
 
-    async def _require(self, conn: Conn, human: str, role: Role) -> None:
-        row = await fetchone(conn, "SELECT role, disabled_at FROM humans WHERE id = %s", (human,))
+    async def _require(self, conn: Conn, human: str, role: Role) -> str:
+        """Check the person's role and return their organization: everything they then name must be in it."""
+        row = await fetchone(conn, "SELECT role, disabled_at, org_id FROM humans WHERE id = %s", (human,))
         if row is None:
             raise PactError("forbidden", f"{human} is not a registered human")
         if row["disabled_at"] is not None:
             raise PactError("forbidden", f"{human} is disabled")
         if _RANK[row["role"]] < _RANK[role]:
             raise PactError("forbidden", f"{human} is {row['role']}; this needs {role}")
+        return str(row["org_id"])
+
+    async def _in_org(self, conn: Conn, kind: str, key: Any, org: str) -> None:
+        if await fetchone(conn, _IN_ORG[kind], (key, org)) is None:
+            raise PactError("not_found", f"{kind} {key} does not exist")
 
     async def _log(
         self,
@@ -104,6 +124,7 @@ class Admin:
         task_id: str | None = None,
         mandate_chain: list[str] | None = None,
     ) -> None:
+        who = await fetchone(conn, "SELECT org_id FROM humans WHERE id = %s", (human,))
         await append_entry(
             conn,
             EntryInput(
@@ -115,6 +136,7 @@ class Admin:
                 action=action,
                 payload=payload,
                 outcome="ok",
+                org_id=str(who["org_id"]) if who else DEFAULT_ORG,
             ),
         )
 
@@ -125,14 +147,18 @@ class Admin:
         """
         async with transaction(self.pool) as conn:
             count = (await fetchone(conn, "SELECT count(*) AS n FROM humans"))["n"]  # type: ignore[index]
+            org = DEFAULT_ORG
             if count > 0:
                 if by is None:
                     raise PactError("forbidden", "only an owner can add people once the first owner exists")
-                await self._require(conn, by, "owner")
+                org = await self._require(conn, by, "owner")
             elif role != "owner":
                 raise PactError("invalid_request", "the first person must be an owner")
+            if await fetchone(conn, "SELECT 1 FROM humans WHERE id = %s", (human_id,)):
+                raise PactError("id_taken", f"person id {human_id} is taken; pick another")
             await conn.execute(
-                "INSERT INTO humans (id, name, role, email) VALUES (%s, %s, %s, %s)", (human_id, name, role, email)
+                "INSERT INTO humans (id, name, role, email, org_id) VALUES (%s, %s, %s, %s, %s)",
+                (human_id, name, role, email, org),
             )
             await self._log(conn, by or human_id, "admin.human.add", {"id": human_id, "role": role, "email": email})
 
@@ -153,19 +179,23 @@ class Admin:
         if name is not None and not name.strip():
             raise PactError("invalid_request", "a person needs a name")
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "owner")
-            row = await fetchone(conn, "SELECT id, role, email, disabled_at FROM humans WHERE id = %s FOR UPDATE", (human_id,))
+            org = await self._require(conn, by, "owner")
+            row = await fetchone(
+                conn, "SELECT id, role, email, disabled_at FROM humans WHERE id = %s AND org_id = %s FOR UPDATE", (human_id, org)
+            )
             if row is None:
                 raise PactError("not_found", f"{human_id} is not a registered person")
             stays_owner = (role or row["role"]) == "owner" and not (disabled if disabled is not None else row["disabled_at"])
             if row["role"] == "owner" and row["disabled_at"] is None and not stays_owner:
                 others = await fetchone(
                     conn,
-                    "SELECT count(*) AS n FROM humans WHERE role = 'owner' AND disabled_at IS NULL AND id <> %s",
-                    (human_id,),
+                    "SELECT count(*) AS n FROM humans WHERE role = 'owner' AND disabled_at IS NULL AND id <> %s AND org_id = %s",
+                    (human_id, org),
                 )
                 if not others or others["n"] == 0:
-                    raise PactError("invalid_request", "the board needs at least one active owner; make someone else owner first")
+                    raise PactError(
+                        "invalid_request", "the organization needs at least one active owner; make someone else owner first"
+                    )
             new_email = (email.strip() or None) if email is not None else row["email"]
             await conn.execute(
                 """UPDATE humans SET name = COALESCE(%s, name), role = COALESCE(%s, role), email = %s,
@@ -193,10 +223,12 @@ class Admin:
 
     async def add_project(self, project_id: str, name: str, *, by: str, production: bool = False) -> None:
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "owner")
+            org = await self._require(conn, by, "owner")
+            if await fetchone(conn, "SELECT 1 FROM projects WHERE id = %s", (project_id,)):
+                raise PactError("id_taken", f"project id {project_id} is taken; pick another")
             await conn.execute(
-                "INSERT INTO projects (id, name, production, created_by) VALUES (%s, %s, %s, %s)",
-                (project_id, name, production, by),
+                "INSERT INTO projects (id, name, production, created_by, org_id) VALUES (%s, %s, %s, %s, %s)",
+                (project_id, name, production, by, org),
             )
             await self._log(conn, by, "admin.project.add", {"id": project_id, "production": production}, project_id=project_id)
 
@@ -204,10 +236,11 @@ class Admin:
         self, project_id: str, *, by: str, production: bool | None = None, frozen: bool | None = None
     ) -> None:
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "owner")
+            org = await self._require(conn, by, "owner")
             cur = await conn.execute(
-                "UPDATE projects SET production = COALESCE(%s, production), frozen = COALESCE(%s, frozen) WHERE id = %s",
-                (production, frozen, project_id),
+                """UPDATE projects SET production = COALESCE(%s, production), frozen = COALESCE(%s, frozen)
+                   WHERE id = %s AND org_id = %s""",
+                (production, frozen, project_id, org),
             )
             if cur.rowcount == 0:
                 raise PactError("not_found", f"project {project_id} does not exist")
@@ -232,10 +265,11 @@ class Admin:
         The token is shown once; only its hash is stored.
         """
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
             out = await self._register(
                 conn,
                 agent_id,
+                org=org,
                 by=by,
                 client=client,
                 projects=projects,
@@ -253,6 +287,7 @@ class Admin:
         conn: Conn,
         agent_id: str,
         *,
+        org: str,
         by: str,
         client: Client,
         projects: list[str],
@@ -275,18 +310,23 @@ class Admin:
         if bad:
             raise PactError("invalid_request", f"invalid scope: {', '.join(bad)}")
         if await fetchone(conn, "SELECT 1 FROM agents WHERE id = %s", (agent_id,)):
-            raise PactError("invalid_request", f"agent {agent_id} already exists; pick another name")
+            raise PactError("id_taken", f"agent id {agent_id} is taken; pick another name")
+        if owner:
+            await self._in_org(conn, "human", owner, org)
         for p in projects:
-            row = await fetchone(conn, "SELECT production FROM projects WHERE id = %s", (p,))
+            row = await fetchone(conn, "SELECT production FROM projects WHERE id = %s AND org_id = %s", (p, org))
             if row is None:
                 raise PactError("not_found", f"project {p} does not exist")
             if client == "runner" and row["production"]:
                 raise PactError("project_mismatch", f"project {p} is production; a Runner may not be registered on it")
         await conn.execute(
-            "INSERT INTO agents (id, owner, client, role_id) VALUES (%s, %s, %s, %s)", (agent_id, owner or by, client, role_id)
+            "INSERT INTO agents (id, owner, client, role_id, org_id) VALUES (%s, %s, %s, %s, %s)",
+            (agent_id, owner or by, client, role_id, org),
         )
         for p in projects:
-            await conn.execute("INSERT INTO agent_projects (agent_id, project_id) VALUES (%s, %s)", (agent_id, p))
+            await conn.execute(
+                "INSERT INTO agent_projects (agent_id, project_id, org_id) VALUES (%s, %s, %s)", (agent_id, p, org)
+            )
         mandate = await issue_root(
             conn,
             human=by,
@@ -324,14 +364,16 @@ class Admin:
 
     async def issue_token(self, agent_id: str, *, by: str, days: float = DEFAULT_TOKEN_DAYS) -> str:
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
+            await self._in_org(conn, "agent", agent_id, org)
             token = await self._issue_token(conn, agent_id, days)
             await self._log(conn, by, "admin.token.issue", {"agent": agent_id, "days": days})
             return token
 
     async def revoke_tokens(self, agent_id: str, *, by: str) -> int:
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
+            await self._in_org(conn, "agent", agent_id, org)
             cur = await conn.execute(
                 "UPDATE agent_tokens SET revoked_at = now() WHERE agent_id = %s AND revoked_at IS NULL", (agent_id,)
             )
@@ -351,7 +393,8 @@ class Admin:
             raise PactError("invalid_request", str(err)) from err
         kid = b64url(hashlib.sha256(raw).digest())[:16]
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
+            await self._in_org(conn, "agent", agent_id, org)
             agent = await get_agent(conn, agent_id)
             if agent is None:
                 raise PactError("not_found", f"agent {agent_id} does not exist")
@@ -368,7 +411,8 @@ class Admin:
 
     async def revoke_agent_key(self, agent_id: str, kid: str, *, by: str) -> int:
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
+            await self._in_org(conn, "agent", agent_id, org)
             cur = await conn.execute(
                 "UPDATE agent_keys SET revoked_at = now() WHERE agent_id = %s AND kid = %s AND revoked_at IS NULL",
                 (agent_id, kid),
@@ -389,17 +433,19 @@ class Admin:
         except ValueError as err:
             raise PactError("invalid_request", str(err)) from err
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "owner")
-            if await fetchone(conn, "SELECT 1 FROM humans WHERE id = %s", (human,)) is None:
+            org = await self._require(conn, by, "owner")
+            if await fetchone(conn, "SELECT 1 FROM humans WHERE id = %s AND org_id = %s", (human, org)) is None:
                 raise PactError("not_found", f"{human} is not a registered human")
-            existing = await fetchone(conn, "SELECT revoked_at FROM trusted_roots WHERE principal = %s FOR UPDATE", (raw,))
+            existing = await fetchone(
+                conn, "SELECT revoked_at, org_id FROM trusted_roots WHERE principal = %s FOR UPDATE", (raw,)
+            )
             principal = b64url(raw)
-            if existing is not None and existing["revoked_at"] is None:
+            if existing is not None and (existing["revoked_at"] is None or existing["org_id"] != org):
                 raise PactError("invalid_request", "this key is already a trusted root")
             if existing is None:
                 await conn.execute(
-                    "INSERT INTO trusted_roots (principal, human, label, created_by) VALUES (%s, %s, %s, %s)",
-                    (raw, human, label, by),
+                    "INSERT INTO trusted_roots (principal, human, label, created_by, org_id) VALUES (%s, %s, %s, %s, %s)",
+                    (raw, human, label, by, org),
                 )
             else:
                 await conn.execute(
@@ -418,21 +464,26 @@ class Admin:
         except ValueError as err:
             raise PactError("invalid_request", "a principal is base64url of a 32-byte public key") from err
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "owner")
+            org = await self._require(conn, by, "owner")
             cur = await conn.execute(
-                "UPDATE trusted_roots SET revoked_at = now() WHERE principal = %s AND revoked_at IS NULL", (raw,)
+                "UPDATE trusted_roots SET revoked_at = now() WHERE principal = %s AND org_id = %s AND revoked_at IS NULL",
+                (raw, org),
             )
-            if cur.rowcount == 0 and await fetchone(conn, "SELECT 1 FROM trusted_roots WHERE principal = %s", (raw,)) is None:
+            if (
+                cur.rowcount == 0
+                and await fetchone(conn, "SELECT 1 FROM trusted_roots WHERE principal = %s AND org_id = %s", (raw, org)) is None
+            ):
                 raise PactError("not_found", f"{principal} is not a trusted root")
             await self._log(conn, by, "admin.trusted_root.revoke", {"principal": principal})
             return cur.rowcount
 
-    async def list_trusted_roots(self) -> list[dict[str, Any]]:
+    async def list_trusted_roots(self, org: str) -> list[dict[str, Any]]:
         async with transaction(self.pool) as conn:
             rows = await fetchall(
                 conn,
                 """SELECT principal, human, label, created_by, created_at, active_since, revoked_at
-                   FROM trusted_roots ORDER BY created_at""",
+                   FROM trusted_roots WHERE org_id = %s ORDER BY created_at""",
+                (org,),
             )
         return [{**r, "principal": b64url(bytes(r["principal"]))} for r in rows]
 
@@ -447,12 +498,13 @@ class Admin:
         """
         fmt = credentials.get(format_name)
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
-            if await get_agent(conn, agent_id) is None:
-                raise PactError("not_found", f"agent {agent_id} does not exist")
+            org = await self._require(conn, by, "approver")
+            await self._in_org(conn, "agent", agent_id, org)
             roots = [
                 credentials.TrustedRoot(principal=b64url(bytes(r["principal"])), human=r["human"])
-                for r in await fetchall(conn, "SELECT principal, human FROM trusted_roots WHERE revoked_at IS NULL")
+                for r in await fetchall(
+                    conn, "SELECT principal, human FROM trusted_roots WHERE revoked_at IS NULL AND org_id = %s", (org,)
+                )
             ]
             got = fmt.ingest(credential.strip().encode(), trusted_roots=roots)
             keys = {
@@ -519,7 +571,8 @@ class Admin:
     ) -> str:
         """A further root mandate for an existing agent, e.g. after a deferred task asked for more scope."""
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
+            await self._in_org(conn, "agent", holder, org)
             projects = {p.id for p in await agent_projects(conn, holder)}
             foreign = [s for s in scope if "@project:" in s and s.split("@project:", 1)[1] not in projects]
             if foreign:
@@ -557,7 +610,8 @@ class Admin:
         if not scope or bad:
             raise PactError("invalid_request", f"invalid scope: {', '.join(bad)}" if bad else "scope is empty")
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
+            await self._in_org(conn, "mandate", mandate_id, org)
             old = await get_mandate(conn, mandate_id)
             if old is None:
                 raise PactError("not_found", f"mandate {mandate_id} does not exist")
@@ -593,25 +647,23 @@ class Admin:
 
     async def revoke_mandate(self, mandate_id: str, *, by: str) -> dict[str, Any]:
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
-            if await get_mandate(conn, mandate_id) is None:
-                raise PactError("not_found", f"mandate {mandate_id} does not exist")
+            org = await self._require(conn, by, "approver")
+            await self._in_org(conn, "mandate", mandate_id, org)
             r = await revoke_subtree(conn, mandate_id)
             await self._log(conn, by, "admin.mandate.revoke", {"mandate_id": mandate_id}, mandate_chain=[mandate_id])
             await revoke_closed_task_mandates(conn, [tid for tid, _ in r["stopped"]])
             return {"descendant_mandates": r["descendant_mandates"], "tasks_stopped": r["tasks_stopped"]}
 
-    async def revoke_mandate_impact(self, mandate_id: str) -> dict[str, Any]:
+    async def revoke_mandate_impact(self, mandate_id: str, org: str) -> dict[str, Any]:
         """A dry run of revoke_mandate, for the confirmation people see before they revoke."""
         async with transaction(self.pool) as conn:
-            if await get_mandate(conn, mandate_id) is None:
-                raise PactError("not_found", f"mandate {mandate_id} does not exist")
+            await self._in_org(conn, "mandate", mandate_id, org)
             return await revoke_impact(conn, mandate_id)
 
     async def set_agent_status(self, agent_id: str, status: Literal["active", "paused", "banned"], *, by: str) -> None:
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "owner" if status == "banned" else "approver")
-            cur = await conn.execute("UPDATE agents SET status = %s WHERE id = %s", (status, agent_id))
+            org = await self._require(conn, by, "owner" if status == "banned" else "approver")
+            cur = await conn.execute("UPDATE agents SET status = %s WHERE id = %s AND org_id = %s", (status, agent_id, org))
             if cur.rowcount == 0:
                 raise PactError("not_found", f"agent {agent_id} does not exist")
             await self._log(conn, by, "admin.agent.status", {"agent": agent_id, "status": status})
@@ -624,8 +676,10 @@ class Admin:
         if len(json.dumps(preferences, ensure_ascii=False)) > PREFERENCES_MAX:
             raise PactError("invalid_request", f"preferences are longer than {PREFERENCES_MAX} characters")
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
-            cur = await conn.execute("UPDATE agents SET preferences = %s WHERE id = %s", (Jsonb(preferences), agent_id))
+            org = await self._require(conn, by, "approver")
+            cur = await conn.execute(
+                "UPDATE agents SET preferences = %s WHERE id = %s AND org_id = %s", (Jsonb(preferences), agent_id, org)
+            )
             if cur.rowcount == 0:
                 raise PactError("not_found", f"agent {agent_id} does not exist")
             await self._log(conn, by, "admin.agent.preferences", {"agent": agent_id, "preferences": preferences})
@@ -633,13 +687,15 @@ class Admin:
 
     # ── hiring from roles ──────────────────────────────────────────────────
 
-    async def list_roles(self, *, archived: bool = False) -> list[dict[str, Any]]:
+    async def list_roles(self, org: str, *, archived: bool = False) -> list[dict[str, Any]]:
         async with transaction(self.pool) as conn:
             return await fetchall(
                 conn,
                 f"""SELECT id, name, description, client, actions, limits, delegations, mandate_days, token_days,
                            settings, instructions, position, archived_at, updated_at, updated_by
-                    FROM agent_roles {"" if archived else "WHERE archived_at IS NULL"} ORDER BY position, id""",
+                    FROM agent_roles WHERE org_id = %s {"" if archived else "AND archived_at IS NULL"}
+                    ORDER BY position, id""",
+                (org,),
             )
 
     async def save_role(self, role_id: str, fields: dict[str, Any], *, by: str) -> dict[str, Any]:
@@ -679,19 +735,19 @@ class Admin:
             by,
         )
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
             try:
                 await conn.execute(
                     """INSERT INTO agent_roles (id, name, description, client, actions, limits, delegations, mandate_days,
-                                                token_days, settings, instructions, position, updated_by)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                                token_days, settings, instructions, position, updated_by, org_id)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                        ON CONFLICT (org_id, id) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description,
                          client = EXCLUDED.client, actions = EXCLUDED.actions, limits = EXCLUDED.limits,
                          delegations = EXCLUDED.delegations, mandate_days = EXCLUDED.mandate_days,
                          token_days = EXCLUDED.token_days, settings = EXCLUDED.settings,
                          instructions = EXCLUDED.instructions, position = EXCLUDED.position,
                          archived_at = NULL, updated_at = now(), updated_by = EXCLUDED.updated_by""",
-                    row,
+                    (*row, org),
                 )
             except psycopg.errors.CheckViolation as err:
                 raise PactError("invalid_request", f"role {role_id} is out of range: {err.diag.constraint_name}") from None
@@ -701,14 +757,14 @@ class Admin:
     async def archive_role(self, role_id: str, *, by: str) -> None:
         """Retire a role: no new hires. Agents already hired keep working."""
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
-            cur = await conn.execute("UPDATE agent_roles SET archived_at = now() WHERE id = %s", (role_id,))
+            org = await self._require(conn, by, "approver")
+            cur = await conn.execute("UPDATE agent_roles SET archived_at = now() WHERE id = %s AND org_id = %s", (role_id, org))
             if cur.rowcount == 0:
                 raise PactError("not_found", f"role {role_id} does not exist")
             await self._log(conn, by, "admin.role.archive", {"role": role_id})
 
-    async def _role(self, conn: Conn, role_id: str) -> dict[str, Any]:
-        role = await fetchone(conn, "SELECT * FROM agent_roles WHERE id = %s", (role_id,))
+    async def _role(self, conn: Conn, role_id: str, org: str) -> dict[str, Any]:
+        role = await fetchone(conn, "SELECT * FROM agent_roles WHERE id = %s AND org_id = %s", (role_id, org))
         if role is None:
             raise PactError("not_found", f"role {role_id} does not exist")
         return role
@@ -733,15 +789,16 @@ class Admin:
         another registered person: an agent that signs in through OAuth answers only to its owner."""
         agent_id = agent_id or f"{role_id}-{project}"
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
-            if owner and not await fetchone(conn, "SELECT 1 FROM humans WHERE id = %s", (owner,)):
+            org = await self._require(conn, by, "approver")
+            if owner and not await fetchone(conn, "SELECT 1 FROM humans WHERE id = %s AND org_id = %s", (owner, org)):
                 raise PactError("not_found", f"{owner} is not a registered person")
-            role = await self._role(conn, role_id)
+            role = await self._role(conn, role_id, org)
             if role["archived_at"]:
                 raise PactError("invalid_request", f"role {role_id} is archived")
             out = await self._register(
                 conn,
                 agent_id,
+                org=org,
                 by=by,
                 client=role["client"],
                 projects=[project],
@@ -753,7 +810,7 @@ class Admin:
                 role_id=role_id,
             )
             if replaces:
-                old = await fetchone(conn, "SELECT id FROM agents WHERE id = %s", (replaces,))
+                old = await fetchone(conn, "SELECT id FROM agents WHERE id = %s AND org_id = %s", (replaces, org))
                 if old is None:
                     raise PactError("not_found", f"agent {replaces} does not exist")
                 await conn.execute("UPDATE agents SET status = 'banned', replaced_by = %s WHERE id = %s", (agent_id, replaces))
@@ -786,7 +843,8 @@ class Admin:
         """A fresh way to connect an agent that uses a token, e.g. on a new machine. Tokens it already
         has keep working until revoked."""
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
+            await self._in_org(conn, "agent", agent_id, org)
             agent = await get_agent(conn, agent_id)
             if agent is None or agent.status == "banned":
                 raise PactError("not_found", f"agent {agent_id} does not exist or is banned")
@@ -800,7 +858,7 @@ class Admin:
         async with transaction(self.pool) as conn:
             row = await fetchone(
                 conn,
-                """SELECT s.agent_id, s.created_by, a.client, a.status, a.role_id,
+                """SELECT s.agent_id, s.created_by, a.client, a.status, a.role_id, a.org_id,
                           (SELECT project_id FROM agent_projects p WHERE p.agent_id = a.id ORDER BY project_id LIMIT 1) AS project
                    FROM setup_codes s JOIN agents a ON a.id = s.agent_id
                    WHERE s.code_hash = %s AND s.used_at IS NULL AND s.expires_at > now()
@@ -810,7 +868,7 @@ class Admin:
             if row is None or row["status"] == "banned":
                 raise PactError("forbidden", "this setup code is unknown, used or expired; get a new one in the Admin UI")
             await conn.execute("UPDATE setup_codes SET used_at = now() WHERE code_hash = %s", (sha256(code),))
-            role = await self._role(conn, row["role_id"]) if row["role_id"] else None
+            role = await self._role(conn, row["role_id"], row["org_id"]) if row["role_id"] else None
             token = await self._issue_token(conn, row["agent_id"], float(role["token_days"]) if role else DEFAULT_TOKEN_DAYS)
             await self._log(conn, row["created_by"], "admin.agent.connect", {"agent": row["agent_id"]})
             project = row["project"] or ""
@@ -830,18 +888,18 @@ class Admin:
         """Renew an agent's term: a new root mandate with its role's scope, budget and length. The old
         one keeps running until it expires; a Runner moves to the new one when it does."""
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
             agent = await fetchone(
                 conn,
                 """SELECT a.id, a.status, a.role_id, (SELECT project_id FROM agent_projects p WHERE p.agent_id = a.id
-                   ORDER BY project_id LIMIT 1) AS project FROM agents a WHERE a.id = %s""",
-                (agent_id,),
+                   ORDER BY project_id LIMIT 1) AS project FROM agents a WHERE a.id = %s AND a.org_id = %s""",
+                (agent_id, org),
             )
             if agent is None or agent["status"] == "banned":
                 raise PactError("not_found", f"agent {agent_id} does not exist or is banned")
             if not agent["role_id"]:
                 raise PactError("invalid_request", f"agent {agent_id} was not hired into a role; change its permissions instead")
-            role = await self._role(conn, agent["role_id"])
+            role = await self._role(conn, agent["role_id"], org)
             mandate = await issue_root(
                 conn,
                 human=by,
@@ -874,15 +932,17 @@ class Admin:
         root mandate it held before, so old rights do not linger until they expire; open tasks
         under them stop. A new owner changes nothing else. Tokens and connection stay."""
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
             agent = await fetchone(
-                conn, "SELECT id, client, status, role_id, owner FROM agents WHERE id = %s FOR UPDATE", (agent_id,)
+                conn,
+                "SELECT id, client, status, role_id, owner FROM agents WHERE id = %s AND org_id = %s FOR UPDATE",
+                (agent_id, org),
             )
             if agent is None or agent["status"] == "banned":
                 raise PactError("not_found", f"agent {agent_id} does not exist or is banned")
             current = [p.id for p in await agent_projects(conn, agent_id)]
             if owner is not None and owner != agent["owner"]:
-                who = await fetchone(conn, "SELECT disabled_at FROM humans WHERE id = %s", (owner,))
+                who = await fetchone(conn, "SELECT disabled_at FROM humans WHERE id = %s AND org_id = %s", (owner, org))
                 if who is None or who["disabled_at"] is not None:
                     raise PactError("not_found", f"{owner} is not an active registered person")
                 await conn.execute("UPDATE agents SET owner = %s WHERE id = %s", (owner, agent_id))
@@ -893,7 +953,7 @@ class Admin:
                 rid = role_id or agent["role_id"]
                 if not rid:
                     raise PactError("invalid_request", f"agent {agent_id} has no role; give it one first")
-                role = await self._role(conn, rid)
+                role = await self._role(conn, rid, org)
                 if role["archived_at"]:
                     raise PactError("invalid_request", f"role {rid} is archived")
                 if role["client"] != agent["client"]:
@@ -905,7 +965,7 @@ class Admin:
                 if agent["client"] in ("code", "runner") and len(new_projects) != 1:
                     raise PactError("invalid_request", f"a {agent['client']} agent belongs to exactly one project")
                 for p in new_projects:
-                    row = await fetchone(conn, "SELECT production FROM projects WHERE id = %s", (p,))
+                    row = await fetchone(conn, "SELECT production FROM projects WHERE id = %s AND org_id = %s", (p, org))
                     if row is None:
                         raise PactError("not_found", f"project {p} does not exist")
                     if agent["client"] == "runner" and row["production"]:
@@ -918,7 +978,9 @@ class Admin:
                 )
                 await conn.execute("DELETE FROM agent_projects WHERE agent_id = %s", (agent_id,))
                 for p in new_projects:
-                    await conn.execute("INSERT INTO agent_projects (agent_id, project_id) VALUES (%s, %s)", (agent_id, p))
+                    await conn.execute(
+                        "INSERT INTO agent_projects (agent_id, project_id, org_id) VALUES (%s, %s, %s)", (agent_id, p, org)
+                    )
                 mandate = await issue_root(
                     conn,
                     human=by,
@@ -959,18 +1021,19 @@ class Admin:
 
     async def set_halted(self, halted: bool, *, by: str) -> None:
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "owner")
-            await conn.execute("UPDATE system_state SET halted = %s", (halted,))
+            org = await self._require(conn, by, "owner")
+            await conn.execute("UPDATE orgs SET halted = %s WHERE id = %s", (halted, org))
             await self._log(conn, by, "admin.kill_switch", {"halted": halted})
 
     async def approve_task(self, task_id: str, *, by: str, approve: bool = True) -> None:
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
             row = await fetchone(
                 conn,
                 """UPDATE tasks SET status = %s, approved_by = %s, approved_at = now()
-                   WHERE id = %s AND status = 'auth_required' RETURNING project_id""",
-                ("submitted" if approve else "rejected", by, task_id),
+                   WHERE id::text = %s AND status = 'auth_required'
+                     AND project_id IN (SELECT id FROM projects WHERE org_id = %s) RETURNING project_id""",
+                ("submitted" if approve else "rejected", by, task_id, org),
             )
             if row is None:
                 raise PactError("invalid_request", f"task {task_id} is not waiting for approval")
@@ -982,12 +1045,13 @@ class Admin:
         """Put a deferred task back on the board once a human has decided, with their answer to
         the agent's question if they gave one. The agent reads it as the task's `answer`."""
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
             row = await fetchone(
                 conn,
                 """UPDATE tasks SET status = 'submitted', deferred = false, answer = coalesce(%s, answer)
-                   WHERE id = %s AND deferred RETURNING project_id""",
-                (answer, task_id),
+                   WHERE id::text = %s AND deferred AND project_id IN (SELECT id FROM projects WHERE org_id = %s)
+                   RETURNING project_id""",
+                (answer, task_id, org),
             )
             if row is None:
                 raise PactError("invalid_request", f"task {task_id} is not deferred")
@@ -999,8 +1063,8 @@ class Admin:
         if title is not None and not title.strip():
             raise PactError("invalid_request", "a task needs a title")
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
-            row = await self._open_task(conn, task_id)
+            org = await self._require(conn, by, "approver")
+            row = await self._open_task(conn, task_id, org)
             await conn.execute(
                 "UPDATE tasks SET title = COALESCE(%s, title), body = COALESCE(%s, body) WHERE id = %s",
                 (title.strip() if title else None, body, row["id"]),
@@ -1015,9 +1079,14 @@ class Admin:
             )
             return {"ok": True}
 
-    async def _open_task(self, conn: Conn, task_id: str) -> dict[str, Any]:
+    async def _open_task(self, conn: Conn, task_id: str, org: str) -> dict[str, Any]:
         """Lock a task a person is about to change; closed tasks are left as they ended."""
-        row = await fetchone(conn, "SELECT * FROM tasks WHERE id::text = %s FOR UPDATE", (task_id,))
+        row = await fetchone(
+            conn,
+            """SELECT * FROM tasks WHERE id::text = %s AND project_id IN (SELECT id FROM projects WHERE org_id = %s)
+               FOR UPDATE""",
+            (task_id, org),
+        )
         if row is None:
             raise PactError("not_found", f"task {task_id} does not exist")
         if row["status"] in TERMINAL_STATUSES:
@@ -1032,8 +1101,8 @@ class Admin:
         longer has the task.
         """
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
-            task = await self._open_task(conn, task_id)
+            org = await self._require(conn, by, "approver")
+            task = await self._open_task(conn, task_id, org)
             if task["assignee"]:
                 raise PactError("invalid_request", f"task {task_id} is held by {task['assignee']}; release it first")
             if agent_id is not None:
@@ -1071,8 +1140,8 @@ class Admin:
         The agent's next report gets claim_lost, so it stops without overwriting anyone.
         """
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
-            task = await self._open_task(conn, task_id)
+            org = await self._require(conn, by, "approver")
+            task = await self._open_task(conn, task_id, org)
             if task["status"] != "working" or not task["assignee"]:
                 raise PactError("invalid_request", f"task {task_id} is not held by an agent")
             await conn.execute(
@@ -1093,8 +1162,8 @@ class Admin:
     async def cancel_task(self, task_id: str, *, by: str, reason: str | None = None) -> dict[str, Any]:
         """Close a task nobody should do any more. Its delegated mandate dies with it, as with any close."""
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
-            task = await self._open_task(conn, task_id)
+            org = await self._require(conn, by, "approver")
+            task = await self._open_task(conn, task_id, org)
             await conn.execute(
                 "UPDATE tasks SET status = 'canceled', deferred = false, result = %s WHERE id = %s",
                 (Jsonb({"reason": "canceled_by_human", "by": by, "note": reason}), task["id"]),
@@ -1112,18 +1181,26 @@ class Admin:
 
     async def erase_payload(self, entry_id: int, *, by: str) -> bool:
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "owner")
+            org = await self._require(conn, by, "owner")
+            await self._in_org(conn, "entry", entry_id, org)
             erased = await erase_payload(conn, entry_id)
             await self._log(conn, by, "admin.payload.erase", {"entry_id": entry_id})
             return erased
 
-    async def verify_log(self, chain_key: str | None = None) -> list[dict[str, Any]]:
+    async def verify_log(self, org: str) -> list[dict[str, Any]]:
+        """Recompute the organization's chains: one per project, plus its own for entries with no project."""
         async with transaction(self.pool) as conn:
-            keys = (
-                [chain_key]
-                if chain_key
-                else [r["chain_key"] for r in await fetchall(conn, "SELECT chain_key FROM entry_chain_heads ORDER BY chain_key")]
-            )
+            keys = [
+                r["chain_key"]
+                for r in await fetchall(
+                    conn,
+                    """SELECT h.chain_key FROM entry_chain_heads h
+                       WHERE h.chain_key IN (SELECT id FROM projects WHERE org_id = %s
+                                             UNION SELECT system_chain FROM orgs WHERE id = %s)
+                       ORDER BY h.chain_key""",
+                    (org, org),
+                )
+            ]
             return [(await verify_entry_chain(conn, k)).__dict__ for k in keys or [SYSTEM_CHAIN]]
 
     async def write_note(
@@ -1131,7 +1208,8 @@ class Admin:
     ) -> dict[str, Any]:
         """A person writes project context; pinned notes too."""
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
+            await self._in_org(conn, "project", project_id, org)
             out = await notes.write_note(
                 conn, project_id, key, by=f"human:{by}", title=title, body=body, archive=archive, human=True
             )
@@ -1146,13 +1224,15 @@ class Admin:
 
     async def pin_note(self, project_id: str, key: str, pinned: bool, *, by: str) -> None:
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "approver")
+            org = await self._require(conn, by, "approver")
+            await self._in_org(conn, "project", project_id, org)
             await notes.set_pinned(conn, project_id, key, pinned)
             await self._log(conn, by, "admin.context.pin", {"key": key, "pinned": pinned}, project_id=project_id)
 
     async def erase_note_version(self, version_id: int, *, by: str) -> dict[str, Any]:
         async with transaction(self.pool) as conn:
-            await self._require(conn, by, "owner")
+            org = await self._require(conn, by, "owner")
+            await self._in_org(conn, "note version", version_id, org)
             out = await notes.erase_version(conn, version_id)
             await self._log(conn, by, "admin.context.erase", {"version_id": version_id}, project_id=out["project_id"])
             return out

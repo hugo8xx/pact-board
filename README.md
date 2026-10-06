@@ -262,6 +262,26 @@ Claude Code for work delegated to a `runner` agent, since the board cannot push 
 `pact-admin agent-register runner-web --client runner --projects web --limits '{"runs": 50, "turns": 2000}' --days 7 --by <you>`.
 For a task, the budget a Runner follows is the one on the mandate delegated with that task.
 
+## Organizations
+
+One deployment can serve many organizations. Each one sees only its own people, projects, agents,
+roles, tasks, notes, mandates and log. A person belongs to exactly one organization (`humans.org_id`),
+and every Admin API call is limited to the caller's organization. An id that belongs to another
+organization answers `not_found` with the same words as an id that does not exist.
+
+- **What carries the organization:** people, projects, agents, roles, approval rules, trusted roots,
+  notifications and log entries. Everything else reaches its organization through a project, agent
+  or mandate. The database refuses an agent in another organization's project.
+- **What stays global:** ids of people, projects and agents, because agent ids are part of MCP URLs,
+  tokens and scopes. A taken id answers `id_taken`.
+- **Roles:** role ids such as `chat` or `runner` repeat in every organization. New organizations
+  start from `role_templates`.
+- **Kill switch:** each organization has its own (`orgs.halted`), and the platform-wide
+  `system_state.halted` still stops everyone.
+- **Log:** entries with no project go to the organization's own chain (`orgs.system_chain`). The
+  organization that existed before migration 019 keeps the `_system` chain, because a chain's key is
+  part of every entry's hash.
+
 ## Admin API
 
 `/admin/api/*` is for people, not agents: it takes an OAuth access token whose audience is

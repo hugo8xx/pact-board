@@ -77,7 +77,7 @@ async def test_only_owners_manage_trusted_roots_and_each_stands_for_a_registered
     assert (await refused(world.admin.add_trusted_root(key_text(org), human="ann", by="boss"))).code == "invalid_request"
     assert (await refused(world.admin.revoke_trusted_root(key_text(org), by="ann"))).code == "forbidden"
     assert await world.admin.revoke_trusted_root(key_text(org), by="boss") == 1
-    [row] = await world.admin.list_trusted_roots()
+    [row] = await world.admin.list_trusted_roots("default")
     assert row["principal"] == key_text(org) and row["human"] == "ann" and row["revoked_at"] is not None
     async with transaction(world.pool) as conn:
         actions = [
@@ -207,7 +207,7 @@ async def test_a_revoked_root_can_be_trusted_again_but_old_imports_stay_dead(wor
 
     # A live key cannot be added twice, and every activation is in the audit log.
     assert (await refused(world.admin.add_trusted_root(key_text(keys["org"]), human="boss", by="boss"))).code == "invalid_request"
-    [row] = await world.admin.list_trusted_roots()
+    [row] = await world.admin.list_trusted_roots("default")
     assert row["revoked_at"] is None and row["label"] == "Acme again" and row["active_since"] > row["created_at"]
     async with transaction(world.pool) as conn:
         actions = [
