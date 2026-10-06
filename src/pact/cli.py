@@ -92,7 +92,7 @@ def _parser() -> argparse.ArgumentParser:
     trr = sub.add_parser("trusted-root-revoke", help="stop trusting a key; mandates imported under it stop working")
     trr.add_argument("principal")
     trr.add_argument("--by", required=True)
-    sub.add_parser("trusted-root-list")
+    sub.add_parser("trusted-root-list").add_argument("--org", default="default", help="the organization (default: default)")
     ci = sub.add_parser("credential-import", help="turn an outside credential an agent holds into a root mandate")
     ci.add_argument("agent")
     ci.add_argument("credential", help="the credential as text (a Tenuo warrant stack is base64)")
@@ -174,7 +174,7 @@ async def _run(args: argparse.Namespace) -> Any:
             case "trusted-root-revoke":
                 return {"revoked": await a.revoke_trusted_root(args.principal, by=args.by)}
             case "trusted-root-list":
-                return await a.list_trusted_roots()
+                return await a.list_trusted_roots(args.org)
             case "credential-import":
                 return {"mandate_id": await a.import_credential(args.agent, args.format, args.credential, by=args.by)}
             case "token-revoke":

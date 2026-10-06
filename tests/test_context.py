@@ -144,7 +144,7 @@ async def test_secrets_are_redacted_and_versions_can_be_erased(world: World) -> 
         )
     assert dump is not None and "Somchai" not in dump["payloads"]
     assert dump["note"] == "[erased]" and dump["version"] is None
-    assert all(v["ok"] for v in await world.admin.verify_log())
+    assert all(v["ok"] for v in await world.admin.verify_log("default"))
 
 
 async def test_over_mcp_tool_and_resources(world: World, server_url: str) -> None:  # noqa: F811

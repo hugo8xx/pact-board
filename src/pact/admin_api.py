@@ -7,6 +7,7 @@ through `Admin`, which checks the caller's role and logs the action.
 
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -26,7 +27,16 @@ from .db import Conn, fetchall, fetchone, transaction
 from .errors import PactError
 from .oauth import TokenRejected, Verifier, human_for
 
-Handler = Callable[[Request, str], Awaitable[Any]]
+
+@dataclass(frozen=True)
+class Actor:
+    """The person calling and the organization they belong to. Every read and write is limited to it."""
+
+    id: str
+    org: str
+
+
+Handler = Callable[[Request, Actor], Awaitable[Any]]
 
 _STATUS = {
     "forbidden": 403,
@@ -37,6 +47,7 @@ _STATUS = {
     "scope_exceeded": 400,
     "limit_exceeded": 400,
     "note_pinned": 409,
+    "id_taken": 409,
 }
 
 
@@ -102,8 +113,12 @@ class AdminApi:
                 return _ok({"error": "unauthorized", "message": str(err)}, 401)
             if human is None:
                 return _ok({"error": "forbidden", "message": "this account is not a registered person on the board"}, 403)
+            async with transaction(self.pool) as conn:
+                row = await fetchone(conn, "SELECT org_id FROM humans WHERE id = %s", (human,))
+            if row is None:
+                return _ok({"error": "forbidden", "message": "this account is not a registered person on the board"}, 403)
             try:
-                return _ok(await fn(request, human))
+                return _ok(await fn(request, Actor(human, str(row["org_id"]))))
             except PactError as err:
                 return _ok(err.to_dict(), _STATUS.get(err.code, 409))
 
@@ -111,27 +126,38 @@ class AdminApi:
 
     # ── reads (any role) ─────────────────────────────────────────────────────
 
-    async def me(self, _r: Request, human: str) -> Any:
+    async def me(self, _r: Request, actor: Actor) -> Any:
         async with transaction(self.pool) as conn:
-            return await fetchone(conn, "SELECT id, name, role, email FROM humans WHERE id = %s", (human,))
+            return await fetchone(
+                conn,
+                """SELECT h.id, h.name, h.role, h.email,
+                          jsonb_build_object('id', o.id, 'name', o.name, 'halted', o.halted) AS org
+                   FROM humans h JOIN orgs o ON o.id = h.org_id WHERE h.id = %s""",
+                (actor.id,),
+            )
 
-    async def overview(self, _r: Request, _h: str) -> Any:
+    async def overview(self, _r: Request, actor: Actor) -> Any:
         async with transaction(self.pool) as conn:
-            state = await fetchone(conn, "SELECT halted FROM system_state")
-            agents = await fetchall(conn, "SELECT status, count(*) AS n FROM agents GROUP BY status")
+            org = (actor.org,)
+            state = await fetchone(conn, "SELECT o.halted OR s.halted AS halted FROM orgs o, system_state s WHERE o.id = %s", org)
+            agents = await fetchall(conn, "SELECT status, count(*) AS n FROM agents WHERE org_id = %s GROUP BY status", org)
+            mine = "project_id IN (SELECT id FROM projects WHERE org_id = %s)"
             tasks = await fetchall(
                 conn,
-                """SELECT project_id, status, count(*) AS n FROM tasks
-                   WHERE status IN ('submitted', 'working', 'input_required', 'auth_required')
-                      OR updated_at > now() - interval '7 days'
-                   GROUP BY project_id, status ORDER BY project_id, status""",
+                f"""SELECT project_id, status, count(*) AS n FROM tasks
+                    WHERE {mine} AND (status IN ('submitted', 'working', 'input_required', 'auth_required')
+                                      OR updated_at > now() - interval '7 days')
+                    GROUP BY project_id, status ORDER BY project_id, status""",
+                org,
             )
-            approvals = await fetchone(conn, "SELECT count(*) AS n FROM tasks WHERE status = 'auth_required'")
-            deferred = await fetchone(conn, "SELECT count(*) AS n FROM tasks WHERE deferred")
+            approvals = await fetchone(conn, f"SELECT count(*) AS n FROM tasks WHERE {mine} AND status = 'auth_required'", org)
+            deferred = await fetchone(conn, f"SELECT count(*) AS n FROM tasks WHERE {mine} AND deferred", org)
             active = await fetchall(
                 conn,
                 """SELECT id, client, last_seen FROM agents
-                   WHERE status = 'active' AND last_seen > now() - interval '1 hour' ORDER BY last_seen DESC""",
+                   WHERE org_id = %s AND status = 'active' AND last_seen > now() - interval '1 hour'
+                   ORDER BY last_seen DESC""",
+                org,
             )
         return {
             "halted": bool(state and state["halted"]),
@@ -142,11 +168,15 @@ class AdminApi:
             "active_agents": active,
         }
 
-    async def humans(self, _r: Request, _h: str) -> Any:
+    async def humans(self, _r: Request, actor: Actor) -> Any:
         async with transaction(self.pool) as conn:
-            return await fetchall(conn, "SELECT id, name, role, email, created_at, disabled_at FROM humans ORDER BY created_at")
+            return await fetchall(
+                conn,
+                "SELECT id, name, role, email, created_at, disabled_at FROM humans WHERE org_id = %s ORDER BY created_at",
+                (actor.org,),
+            )
 
-    async def agents(self, _r: Request, _h: str) -> Any:
+    async def agents(self, _r: Request, actor: Actor) -> Any:
         async with transaction(self.pool) as conn:
             return await fetchall(
                 conn,
@@ -160,10 +190,12 @@ class AdminApi:
                             WHERE m.holder = a.id AND m.revoked_at IS NULL AND m.expires_at > now()) AS live_mandates,
                           (SELECT count(*) FROM agent_keys k WHERE k.agent_id = a.id AND k.revoked_at IS NULL) AS keys
                    FROM agents a LEFT JOIN agent_projects ap ON ap.agent_id = a.id
+                   WHERE a.org_id = %s
                    GROUP BY a.id ORDER BY a.id""",
+                (actor.org,),
             )
 
-    async def agent_connection(self, request: Request, _h: str) -> Any:
+    async def agent_connection(self, request: Request, actor: Actor) -> Any:
         """Whether an agent has connected yet, for the Connection Wizard to poll. Shows when its
         latest setup code was made, expires and was used, never the code or its hash."""
         agent_id = request.path_params["agent_id"]
@@ -173,8 +205,8 @@ class AdminApi:
                 """SELECT a.id, a.last_seen, a.created_at, now() AS now,
                           (SELECT count(*) FROM agent_tokens t
                             WHERE t.agent_id = a.id AND t.revoked_at IS NULL AND t.expires_at > now()) AS live_tokens
-                   FROM agents a WHERE a.id = %s""",
-                (agent_id,),
+                   FROM agents a WHERE a.id = %s AND a.org_id = %s""",
+                (agent_id, actor.org),
             )
             if row is None:
                 raise PactError("not_found", f"agent {agent_id} does not exist")
@@ -203,17 +235,18 @@ class AdminApi:
             "hired_at": hired,
         }
 
-    async def projects(self, _r: Request, _h: str) -> Any:
+    async def projects(self, _r: Request, actor: Actor) -> Any:
         async with transaction(self.pool) as conn:
             return await fetchall(
                 conn,
                 """SELECT p.id, p.name, p.production, p.frozen, p.created_by, p.created_at,
                           (SELECT count(*) FROM tasks t WHERE t.project_id = p.id
                              AND t.status IN ('submitted', 'working', 'input_required', 'auth_required')) AS open_tasks
-                   FROM projects p ORDER BY p.id""",
+                   FROM projects p WHERE p.org_id = %s ORDER BY p.id""",
+                (actor.org,),
             )
 
-    async def mandates(self, request: Request, _h: str) -> Any:
+    async def mandates(self, request: Request, actor: Actor) -> Any:
         include_dead = request.query_params.get("all") == "1"
         async with transaction(self.pool) as conn:
             return await fetchall(
@@ -228,11 +261,13 @@ class AdminApi:
                            (SELECT jsonb_build_object('id', t.id, 'title', t.title, 'status', t.status) FROM tasks t
                              WHERE t.delegated_mandate_id = m.id LIMIT 1) AS task
                     FROM mandates m
-                    {"" if include_dead else "WHERE revoked_at IS NULL AND expires_at > now()"}
+                    WHERE m.holder IN (SELECT id FROM agents WHERE org_id = %s)
+                    {"" if include_dead else "AND revoked_at IS NULL AND expires_at > now()"}
                     ORDER BY depth, created_at""",
+                (actor.org,),
             )
 
-    async def credentials_status(self, _r: Request, _h: str) -> Any:
+    async def credentials_status(self, _r: Request, actor: Actor) -> Any:
         """Each registered format's published revocation list (version, ids on it now, where it is
         served) and the format handed to agents on claim."""
         formats = credentials.names()
@@ -262,13 +297,13 @@ class AdminApi:
             ],
         }
 
-    async def mandate_impact(self, request: Request, _h: str) -> Any:
-        return await self.admin.revoke_mandate_impact(request.path_params["mandate_id"])
+    async def mandate_impact(self, request: Request, actor: Actor) -> Any:
+        return await self.admin.revoke_mandate_impact(request.path_params["mandate_id"], actor.org)
 
-    async def tasks(self, request: Request, _h: str) -> Any:
+    async def tasks(self, request: Request, actor: Actor) -> Any:
         q = request.query_params
-        where: list[str] = ["true"]
-        params: list[Any] = []
+        where: list[str] = ["project_id IN (SELECT id FROM projects WHERE org_id = %s)"]
+        params: list[Any] = [actor.org]
         if q.get("status"):
             where.append("status = %s")
             params.append(q["status"])
@@ -293,11 +328,16 @@ class AdminApi:
                 params,
             )
 
-    async def task_trace(self, request: Request, _h: str) -> Any:
+    async def task_trace(self, request: Request, actor: Actor) -> Any:
         """A task, every entry about it, and each entry's chain back to the human root."""
         task_id = request.path_params["task_id"]
         async with transaction(self.pool) as conn:
-            task = await fetchone(conn, "SELECT * FROM tasks WHERE id::text = %s", (task_id,))
+            task = await fetchone(
+                conn,
+                """SELECT * FROM tasks WHERE id::text = %s
+                   AND project_id IN (SELECT id FROM projects WHERE org_id = %s)""",
+                (task_id, actor.org),
+            )
             if task is None:
                 raise PactError("not_found", f"task {task_id} does not exist")
             entries = await fetchall(
@@ -312,15 +352,15 @@ class AdminApi:
             mandates = await fetchall(
                 conn,
                 """SELECT id, parent_id, issuer_kind, issuer, holder, scope, revoked_at, expires_at
-                   FROM mandates WHERE id = ANY(%s::uuid[])""",
-                (ids,),
+                   FROM mandates WHERE id = ANY(%s::uuid[]) AND holder IN (SELECT id FROM agents WHERE org_id = %s)""",
+                (ids, actor.org),
             )
         return {"task": task, "entries": entries, "mandates": mandates}
 
-    async def entries(self, request: Request, _h: str) -> Any:
+    async def entries(self, request: Request, actor: Actor) -> Any:
         q = request.query_params
-        where: list[str] = ["true"]
-        params: list[str | int | datetime] = []
+        where: list[str] = ["e.org_id = %s"]
+        params: list[str | int | datetime] = [actor.org]
         for key, column in (
             ("project", "e.project_id"),
             ("agent", "e.agent_id"),
@@ -353,64 +393,68 @@ class AdminApi:
                 params,
             )
 
-    async def verify_log(self, _r: Request, _h: str) -> Any:
-        return await self.admin.verify_log()
+    async def verify_log(self, _r: Request, actor: Actor) -> Any:
+        return await self.admin.verify_log(actor.org)
 
     # ── writes (role checked inside Admin) ───────────────────────────────────
 
-    async def add_human(self, request: Request, human: str) -> Any:
+    async def add_human(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
         await self.admin.add_human(
-            str(b.get("id", "")), str(b.get("name", "")), b.get("role", "viewer"), by=human, email=b.get("email")
+            str(b.get("id", "")), str(b.get("name", "")), b.get("role", "viewer"), by=actor.id, email=b.get("email")
         )
         return {"ok": True}
 
-    async def add_project(self, request: Request, human: str) -> Any:
+    async def add_project(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
-        await self.admin.add_project(str(b.get("id", "")), str(b.get("name", "")), by=human, production=bool(b.get("production")))
+        await self.admin.add_project(
+            str(b.get("id", "")), str(b.get("name", "")), by=actor.id, production=bool(b.get("production"))
+        )
         return {"ok": True}
 
-    async def update_project(self, request: Request, human: str) -> Any:
+    async def update_project(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
         await self.admin.set_project_flags(
-            request.path_params["project_id"], by=human, production=b.get("production"), frozen=b.get("frozen")
+            request.path_params["project_id"], by=actor.id, production=b.get("production"), frozen=b.get("frozen")
         )
         return {"ok": True}
 
-    async def context_list(self, request: Request, _h: str) -> Any:
+    async def context_list(self, request: Request, actor: Actor) -> Any:
         async with transaction(self.pool) as conn:
+            await self.admin._in_org(conn, "project", request.path_params["project_id"], actor.org)
             return await notes.list_notes(
                 conn, request.path_params["project_id"], archived=request.query_params.get("archived") == "1"
             )
 
-    async def context_note(self, request: Request, _h: str) -> Any:
+    async def context_note(self, request: Request, actor: Actor) -> Any:
         p, k = request.path_params["project_id"], request.path_params["key"]
         async with transaction(self.pool) as conn:
+            await self.admin._in_org(conn, "project", p, actor.org)
             return {"note": await notes.read_note(conn, p, k, archived=True), "versions": await notes.versions(conn, p, k)}
 
-    async def context_write(self, request: Request, human: str) -> Any:
+    async def context_write(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
         return await self.admin.write_note(
-            request.path_params["project_id"], request.path_params["key"], by=human, title=b.get("title"), body=b.get("body")
+            request.path_params["project_id"], request.path_params["key"], by=actor.id, title=b.get("title"), body=b.get("body")
         )
 
-    async def context_action(self, request: Request, human: str) -> Any:
+    async def context_action(self, request: Request, actor: Actor) -> Any:
         p, k, action = request.path_params["project_id"], request.path_params["key"], request.path_params["action"]
         if action in ("pin", "unpin"):
-            await self.admin.pin_note(p, k, action == "pin", by=human)
+            await self.admin.pin_note(p, k, action == "pin", by=actor.id)
             return {"ok": True}
         if action == "archive":
-            return await self.admin.write_note(p, k, by=human, archive=True)
+            return await self.admin.write_note(p, k, by=actor.id, archive=True)
         raise PactError("not_found", f"unknown action {action}")
 
-    async def context_erase(self, request: Request, human: str) -> Any:
-        return await self.admin.erase_note_version(int(request.path_params["version_id"]), by=human)
+    async def context_erase(self, request: Request, actor: Actor) -> Any:
+        return await self.admin.erase_note_version(int(request.path_params["version_id"]), by=actor.id)
 
-    async def register_agent(self, request: Request, human: str) -> Any:
+    async def register_agent(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
         return await self.admin.register_agent(
             str(b.get("id", "")),
-            by=human,
+            by=actor.id,
             client=b.get("client", "code"),
             projects=list(b.get("projects") or []),
             scope=b.get("scope") or None,
@@ -420,33 +464,33 @@ class AdminApi:
             token_days=float(b.get("days", 30)),
         )
 
-    async def agent_status(self, request: Request, human: str) -> Any:
+    async def agent_status(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
-        await self.admin.set_agent_status(request.path_params["agent_id"], b.get("status", "active"), by=human)
+        await self.admin.set_agent_status(request.path_params["agent_id"], b.get("status", "active"), by=actor.id)
         return {"ok": True}
 
-    async def agent_preferences(self, request: Request, human: str) -> Any:
+    async def agent_preferences(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
-        prefs = await self.admin.set_agent_preferences(request.path_params["agent_id"], b.get("preferences"), by=human)
+        prefs = await self.admin.set_agent_preferences(request.path_params["agent_id"], b.get("preferences"), by=actor.id)
         return {"ok": True, "preferences": prefs}
 
-    async def roles(self, request: Request, _h: str) -> Any:
-        return await self.admin.list_roles(archived=request.query_params.get("archived") == "1")
+    async def roles(self, request: Request, actor: Actor) -> Any:
+        return await self.admin.list_roles(actor.org, archived=request.query_params.get("archived") == "1")
 
-    async def save_role(self, request: Request, human: str) -> Any:
-        return await self.admin.save_role(request.path_params["role_id"], await _body(request), by=human)
+    async def save_role(self, request: Request, actor: Actor) -> Any:
+        return await self.admin.save_role(request.path_params["role_id"], await _body(request), by=actor.id)
 
-    async def archive_role(self, request: Request, human: str) -> Any:
-        await self.admin.archive_role(request.path_params["role_id"], by=human)
+    async def archive_role(self, request: Request, actor: Actor) -> Any:
+        await self.admin.archive_role(request.path_params["role_id"], by=actor.id)
         return {"ok": True}
 
-    async def hire(self, request: Request, human: str) -> Any:
+    async def hire(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
         limits = b.get("limits")
         return await self.admin.hire(
             str(b.get("role", "")),
             str(b.get("project", "")),
-            by=human,
+            by=actor.id,
             agent_id=(str(b["id"]).strip() or None) if b.get("id") else None,
             limits={k: float(v) for k, v in limits.items()} if isinstance(limits, dict) else None,
             delegations=int(b["delegations"]) if b.get("delegations") is not None else None,
@@ -455,47 +499,50 @@ class AdminApi:
             owner=b.get("owner") or None,
         )
 
-    async def renew(self, request: Request, human: str) -> Any:
-        return await self.admin.renew(request.path_params["agent_id"], by=human)
+    async def renew(self, request: Request, actor: Actor) -> Any:
+        return await self.admin.renew(request.path_params["agent_id"], by=actor.id)
 
-    async def update_agent(self, request: Request, human: str) -> Any:
+    async def update_agent(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
         projects = b.get("projects")
         return await self.admin.update_agent(
             request.path_params["agent_id"],
-            by=human,
+            by=actor.id,
             role_id=b.get("role_id") or None,
             owner=b.get("owner") or None,
             projects=[str(p) for p in projects] if isinstance(projects, list) else None,
         )
 
-    async def update_human(self, request: Request, human: str) -> Any:
+    async def update_human(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
         return await self.admin.update_human(
             request.path_params["human_id"],
-            by=human,
+            by=actor.id,
             name=b.get("name"),
             email=b.get("email"),
             role=b.get("role"),
             disabled=b.get("disabled") if isinstance(b.get("disabled"), bool) else None,
         )
 
-    async def change_role(self, request: Request, human: str) -> Any:
+    async def change_role(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
-        return await self.admin.change_role(request.path_params["agent_id"], str(b.get("role_id") or ""), by=human)
+        return await self.admin.change_role(request.path_params["agent_id"], str(b.get("role_id") or ""), by=actor.id)
 
-    async def setup_code(self, request: Request, human: str) -> Any:
-        return await self.admin.setup_code(request.path_params["agent_id"], by=human)
+    async def setup_code(self, request: Request, actor: Actor) -> Any:
+        return await self.admin.setup_code(request.path_params["agent_id"], by=actor.id)
 
-    async def issue_token(self, request: Request, human: str) -> Any:
+    async def issue_token(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
-        return {"token": await self.admin.issue_token(request.path_params["agent_id"], by=human, days=float(b.get("days", 30)))}
+        return {
+            "token": await self.admin.issue_token(request.path_params["agent_id"], by=actor.id, days=float(b.get("days", 30)))
+        }
 
-    async def revoke_tokens(self, request: Request, human: str) -> Any:
-        return {"revoked": await self.admin.revoke_tokens(request.path_params["agent_id"], by=human)}
+    async def revoke_tokens(self, request: Request, actor: Actor) -> Any:
+        return {"revoked": await self.admin.revoke_tokens(request.path_params["agent_id"], by=actor.id)}
 
-    async def agent_keys(self, request: Request, _h: str) -> Any:
+    async def agent_keys(self, request: Request, actor: Actor) -> Any:
         async with transaction(self.pool) as conn:
+            await self.admin._in_org(conn, "agent", request.path_params["agent_id"], actor.org)
             return await fetchall(
                 conn,
                 """SELECT kid, encode(public_key, 'base64') AS public_key_b64, created_at, created_by, revoked_at
@@ -503,39 +550,39 @@ class AdminApi:
                 (request.path_params["agent_id"],),
             )
 
-    async def add_agent_key(self, request: Request, human: str) -> Any:
+    async def add_agent_key(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
-        return await self.admin.add_agent_key(request.path_params["agent_id"], str(b.get("public_key", "")), by=human)
+        return await self.admin.add_agent_key(request.path_params["agent_id"], str(b.get("public_key", "")), by=actor.id)
 
-    async def revoke_agent_key(self, request: Request, human: str) -> Any:
+    async def revoke_agent_key(self, request: Request, actor: Actor) -> Any:
         p = request.path_params
-        return {"revoked": await self.admin.revoke_agent_key(p["agent_id"], p["kid"], by=human)}
+        return {"revoked": await self.admin.revoke_agent_key(p["agent_id"], p["kid"], by=actor.id)}
 
-    async def trusted_roots(self, _r: Request, _h: str) -> Any:
-        return await self.admin.list_trusted_roots()
+    async def trusted_roots(self, _r: Request, actor: Actor) -> Any:
+        return await self.admin.list_trusted_roots(actor.org)
 
-    async def add_trusted_root(self, request: Request, human: str) -> Any:
+    async def add_trusted_root(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
         return await self.admin.add_trusted_root(
-            str(b.get("public_key", "")), human=str(b.get("human", "")), by=human, label=b.get("label") or None
+            str(b.get("public_key", "")), human=str(b.get("human", "")), by=actor.id, label=b.get("label") or None
         )
 
-    async def revoke_trusted_root(self, request: Request, human: str) -> Any:
-        return {"revoked": await self.admin.revoke_trusted_root(request.path_params["principal"], by=human)}
+    async def revoke_trusted_root(self, request: Request, actor: Actor) -> Any:
+        return {"revoked": await self.admin.revoke_trusted_root(request.path_params["principal"], by=actor.id)}
 
-    async def import_credential(self, request: Request, human: str) -> Any:
+    async def import_credential(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
         mandate_id = await self.admin.import_credential(
-            request.path_params["agent_id"], str(b.get("format", "")), str(b.get("credential", "")), by=human
+            request.path_params["agent_id"], str(b.get("format", "")), str(b.get("credential", "")), by=actor.id
         )
         return {"mandate_id": mandate_id}
 
-    async def issue_mandate(self, request: Request, human: str) -> Any:
+    async def issue_mandate(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
         return {
             "mandate_id": await self.admin.issue_mandate(
                 str(b.get("holder", "")),
-                by=human,
+                by=actor.id,
                 scope=list(b.get("scope") or []),
                 limits=b.get("limits") or None,
                 delegations=int(b.get("delegations", 1)),
@@ -543,11 +590,11 @@ class AdminApi:
             )
         }
 
-    async def replace_mandate(self, request: Request, human: str) -> Any:
+    async def replace_mandate(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
         return await self.admin.replace_mandate(
             request.path_params["mandate_id"],
-            by=human,
+            by=actor.id,
             scope=list(b.get("scope") or []),
             limits=b.get("limits"),
             delegations=None if b.get("delegations") is None else int(b["delegations"]),
@@ -555,39 +602,39 @@ class AdminApi:
             revoke=bool(b.get("revoke")),
         )
 
-    async def revoke_mandate(self, request: Request, human: str) -> Any:
-        return await self.admin.revoke_mandate(request.path_params["mandate_id"], by=human)
+    async def revoke_mandate(self, request: Request, actor: Actor) -> Any:
+        return await self.admin.revoke_mandate(request.path_params["mandate_id"], by=actor.id)
 
-    async def decide_task(self, request: Request, human: str) -> Any:
+    async def decide_task(self, request: Request, actor: Actor) -> Any:
         decision = request.path_params["decision"]
         task_id = request.path_params["task_id"]
         if decision in ("approve", "reject"):
-            await self.admin.approve_task(task_id, by=human, approve=decision == "approve")
+            await self.admin.approve_task(task_id, by=actor.id, approve=decision == "approve")
         elif decision == "resume":
             answer = str((await _body(request)).get("answer") or "").strip() or None
-            await self.admin.resume_task(task_id, by=human, answer=answer)
+            await self.admin.resume_task(task_id, by=actor.id, answer=answer)
         elif decision == "assign":
             agent = (await _body(request)).get("agent") or None
-            return {"ok": True, **await self.admin.assign_task(task_id, agent, by=human)}
+            return {"ok": True, **await self.admin.assign_task(task_id, agent, by=actor.id)}
         elif decision == "release":
-            return {"ok": True, **await self.admin.release_task(task_id, by=human)}
+            return {"ok": True, **await self.admin.release_task(task_id, by=actor.id)}
         elif decision == "edit":
             b = await _body(request)
-            return await self.admin.edit_task(task_id, by=human, title=b.get("title"), body=b.get("body"))
+            return await self.admin.edit_task(task_id, by=actor.id, title=b.get("title"), body=b.get("body"))
         elif decision == "cancel":
             reason = (await _body(request)).get("reason") or None
-            return {"ok": True, **await self.admin.cancel_task(task_id, by=human, reason=reason)}
+            return {"ok": True, **await self.admin.cancel_task(task_id, by=actor.id, reason=reason)}
         else:
             raise PactError("not_found", f"unknown decision {decision}")
         return {"ok": True}
 
-    async def kill_switch(self, request: Request, human: str) -> Any:
+    async def kill_switch(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
-        await self.admin.set_halted(bool(b.get("halted")), by=human)
+        await self.admin.set_halted(bool(b.get("halted")), by=actor.id)
         return {"halted": bool(b.get("halted"))}
 
-    async def erase_payload(self, request: Request, human: str) -> Any:
-        return {"erased": await self.admin.erase_payload(int(request.path_params["entry_id"]), by=human)}
+    async def erase_payload(self, request: Request, actor: Actor) -> Any:
+        return {"erased": await self.admin.erase_payload(int(request.path_params["entry_id"]), by=actor.id)}
 
 
 def build_admin_app(pool: AsyncConnectionPool[Conn], verifier: Verifier) -> Starlette:

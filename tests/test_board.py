@@ -464,7 +464,7 @@ async def test_erasing_a_payload_keeps_the_chain_valid_and_tampering_is_caught(w
         await world.board.post(
             world.agents["chat-boss"], project_id="web", title=f"customer {i}", mandate_id=world.roots["chat-boss"]
         )
-    assert all(v["ok"] for v in await world.admin.verify_log("web"))
+    assert all(v["ok"] for v in await world.admin.verify_log("default"))
 
     async with transaction(world.pool) as conn:
         entry = await fetchone(
@@ -472,13 +472,13 @@ async def test_erasing_a_payload_keeps_the_chain_valid_and_tampering_is_caught(w
         )
     assert entry is not None
     assert await world.admin.erase_payload(entry["id"], by="boss")
-    assert all(v["ok"] for v in await world.admin.verify_log("web"))
+    assert all(v["ok"] for v in await world.admin.verify_log("default"))
 
     async with transaction(world.pool) as conn:
         await conn.execute("ALTER TABLE entries DISABLE TRIGGER entries_no_update")
         await conn.execute("UPDATE entries SET outcome = 'scope_exceeded' WHERE id = %s", (entry["id"],))
         await conn.execute("ALTER TABLE entries ENABLE TRIGGER entries_no_update")
-    [verdict] = await world.admin.verify_log("web")
+    [verdict] = [v for v in await world.admin.verify_log("default") if v["chain_key"] == "web"]
     assert verdict["ok"] is False and verdict["broken_at"] == entry["id"]
 
 
@@ -646,7 +646,7 @@ async def test_sweep_revokes_mandates_left_behind_by_closed_tasks(world: World) 
     code = world.agents["code-web"]
     await refused(world.board.list_tasks(code, mandate_id=done["delegated_mandate_id"]), "mandate_revoked")
     await world.board.list_tasks(code, mandate_id=still_open["delegated_mandate_id"])
-    assert all(v["ok"] for v in await world.admin.verify_log())
+    assert all(v["ok"] for v in await world.admin.verify_log("default"))
 
 
 async def test_input_required_waits_for_a_human_and_resumes(world: World) -> None:
