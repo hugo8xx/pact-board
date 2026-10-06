@@ -144,7 +144,7 @@ class AdminApi:
 
     async def humans(self, _r: Request, _h: str) -> Any:
         async with transaction(self.pool) as conn:
-            return await fetchall(conn, "SELECT id, name, role, email, created_at FROM humans ORDER BY created_at")
+            return await fetchall(conn, "SELECT id, name, role, email, created_at, disabled_at FROM humans ORDER BY created_at")
 
     async def agents(self, _r: Request, _h: str) -> Any:
         async with transaction(self.pool) as conn:
@@ -458,6 +458,28 @@ class AdminApi:
     async def renew(self, request: Request, human: str) -> Any:
         return await self.admin.renew(request.path_params["agent_id"], by=human)
 
+    async def update_agent(self, request: Request, human: str) -> Any:
+        b = await _body(request)
+        projects = b.get("projects")
+        return await self.admin.update_agent(
+            request.path_params["agent_id"],
+            by=human,
+            role_id=b.get("role_id") or None,
+            owner=b.get("owner") or None,
+            projects=[str(p) for p in projects] if isinstance(projects, list) else None,
+        )
+
+    async def update_human(self, request: Request, human: str) -> Any:
+        b = await _body(request)
+        return await self.admin.update_human(
+            request.path_params["human_id"],
+            by=human,
+            name=b.get("name"),
+            email=b.get("email"),
+            role=b.get("role"),
+            disabled=b.get("disabled") if isinstance(b.get("disabled"), bool) else None,
+        )
+
     async def change_role(self, request: Request, human: str) -> Any:
         b = await _body(request)
         return await self.admin.change_role(request.path_params["agent_id"], str(b.get("role_id") or ""), by=human)
@@ -549,6 +571,9 @@ class AdminApi:
             return {"ok": True, **await self.admin.assign_task(task_id, agent, by=human)}
         elif decision == "release":
             return {"ok": True, **await self.admin.release_task(task_id, by=human)}
+        elif decision == "edit":
+            b = await _body(request)
+            return await self.admin.edit_task(task_id, by=human, title=b.get("title"), body=b.get("body"))
         elif decision == "cancel":
             reason = (await _body(request)).get("reason") or None
             return {"ok": True, **await self.admin.cancel_task(task_id, by=human, reason=reason)}
@@ -589,6 +614,8 @@ def build_admin_app(pool: AsyncConnectionPool[Conn], verifier: Verifier) -> Star
             Route(f"{p}/agents/{{agent_id}}/connection", r(a.agent_connection)),
             Route(f"{p}/agents/{{agent_id}}/renew", r(a.renew), methods=["POST"]),
             Route(f"{p}/agents/{{agent_id}}/role", r(a.change_role), methods=["POST"]),
+            Route(f"{p}/agents/{{agent_id}}", r(a.update_agent), methods=["PATCH"]),
+            Route(f"{p}/humans/{{human_id}}", r(a.update_human), methods=["PATCH"]),
             Route(f"{p}/agents/{{agent_id}}/setup-code", r(a.setup_code), methods=["POST"]),
             Route(f"{p}/roles", r(a.roles)),
             Route(f"{p}/roles/{{role_id}}", r(a.save_role), methods=["PUT"]),

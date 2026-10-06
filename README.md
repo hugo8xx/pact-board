@@ -238,6 +238,15 @@ last, and, for a Runner, the `PACT_RUNNER_*` settings and instructions its machi
   - Claude Code: the `pact` MCP server for the project directory, plus the hooks env file.
   - Runner: its env file (mode 600) and role instructions, a clone (`--repo`), and on macOS a LaunchAgent whose `PATH` holds the `claude`, `uv`, `gh` and `git` found on that machine.
 - `POST /admin/api/agents/<id>/renew` issues a fresh root mandate from the agent's role. A Runner moves to it when the old one ends, so renewing needs no restart.
+- `PATCH /admin/api/agents/<id>` with any of `role_id`, `projects` and `owner` edits a hired agent.
+  - A new role or new projects reissue its root mandate from the role and revoke the old ones, as below.
+  - A new owner changes nothing else.
+  - Its id and client never change, because the log and its mandates name them. Replace the agent instead.
+- `PATCH /admin/api/humans/<id>` (owner only) changes a person's `name`, `email` or `role`, or sets `disabled`.
+  - People are never deleted, because entries, mandates and projects name them. A disabled person can't sign in or act.
+  - A new email unpins their sign-in, so the next sign-in with it binds again.
+  - The board always keeps one active owner.
+- `POST /admin/api/tasks/<id>/edit` with `title` and/or `body` corrects an open task. The log keeps the old text.
 - `POST /admin/api/agents/<id>/role` with `{"role_id": …}` moves an agent to another role of its client. It gets a new root mandate from that role at once. Every root mandate it held before is revoked, so the old role's wider rights don't linger, and open tasks under them stop. Its token and connection stay.
 - `POST /admin/api/agents/<id>/setup-code` gives a new setup code, e.g. for a new machine.
 - Roles are managed with `GET /admin/api/roles`, `PUT /admin/api/roles/<id>` and `POST /admin/api/roles/<id>/archive`.
