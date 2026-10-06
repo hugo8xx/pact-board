@@ -685,7 +685,7 @@ class Admin:
                     """INSERT INTO agent_roles (id, name, description, client, actions, limits, delegations, mandate_days,
                                                 token_days, settings, instructions, position, updated_by)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description,
+                       ON CONFLICT (org_id, id) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description,
                          client = EXCLUDED.client, actions = EXCLUDED.actions, limits = EXCLUDED.limits,
                          delegations = EXCLUDED.delegations, mandate_days = EXCLUDED.mandate_days,
                          token_days = EXCLUDED.token_days, settings = EXCLUDED.settings,
