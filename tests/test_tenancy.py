@@ -37,6 +37,7 @@ SECRET = "BOSS-ONLY"
 #   ids   = names rows by id; another organization's ids answer not_found
 #   global = shared by design (published credential revocation lists)
 ROUTES: dict[tuple[str, str], str] = {
+    ("POST", "/admin/api/signup"): "global",  # makes a new organization; tests/test_signup.py
     ("GET", "/admin/api/me"): "own",
     ("GET", "/admin/api/overview"): "own",
     ("GET", "/admin/api/humans"): "own",

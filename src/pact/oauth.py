@@ -141,24 +141,45 @@ class Verifier:
         return str(info.get("email") or "") or None
 
 
-async def human_for(conn: Conn, verifier: Verifier, token: str, claims: dict[str, Any]) -> str | None:
-    """The board human this sign-in belongs to. Matched by email once, then pinned by `sub`."""
+@dataclass(frozen=True)
+class SignIn:
+    """Who a verified sign-in is on the board: a person (maybe disabled), or nobody yet. `email` is
+    the verified email when it had to be looked up, so a sign-up need not ask the issuer again."""
+
+    human: str | None = None
+    disabled: bool = False
+    email: str | None = None
+
+
+async def sign_in(conn: Conn, verifier: Verifier, token: str, claims: dict[str, Any]) -> SignIn:
+    """Find the board person for a sign-in. Matched by email once (an invitation), then pinned by `sub`."""
     issuer = verifier.settings.issuer
     row = await fetchone(
         conn, "SELECT id, disabled_at FROM humans WHERE auth_issuer = %s AND auth_sub = %s", (issuer, claims["sub"])
     )
     if row:
-        return None if row["disabled_at"] else str(row["id"])
+        return SignIn(str(row["id"]), disabled=row["disabled_at"] is not None)
     email = await verifier.email_of(token, claims)
     if not email:
-        return None
+        return SignIn()
     row = await fetchone(
         conn,
         """UPDATE humans SET auth_issuer = %s, auth_sub = %s
            WHERE lower(email) = lower(%s) AND auth_sub IS NULL AND disabled_at IS NULL RETURNING id""",
         (issuer, claims["sub"], email),
     )
-    return str(row["id"]) if row else None
+    if row:
+        return SignIn(str(row["id"]), email=email)
+    disabled = await fetchone(
+        conn, "SELECT id FROM humans WHERE lower(email) = lower(%s) AND auth_sub IS NULL AND disabled_at IS NOT NULL", (email,)
+    )
+    return SignIn(str(disabled["id"]), disabled=True, email=email) if disabled else SignIn(email=email)
+
+
+async def human_for(conn: Conn, verifier: Verifier, token: str, claims: dict[str, Any]) -> str | None:
+    """The active board person this sign-in belongs to, if any."""
+    who = await sign_in(conn, verifier, token, claims)
+    return None if who.disabled else who.human
 
 
 async def agent_for_oauth(conn: Conn, verifier: Verifier, agent_id: str, token: str) -> Agent | None:

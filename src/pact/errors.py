@@ -26,6 +26,12 @@ ErrorCode = Literal[
     "handoff_required",
     "agent_busy",
     "id_taken",
+    # Signing up: who the sign-in is, and whether sign-up is open.
+    "not_registered",
+    "account_disabled",
+    "already_registered",
+    "signup_closed",
+    "signup_busy",
 ]
 
 
