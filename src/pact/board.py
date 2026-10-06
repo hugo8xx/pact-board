@@ -212,6 +212,12 @@ class Board:
         async def run(conn: Conn, _ctx: _CallContext) -> dict[str, Any]:
             projects = await agent_projects(conn, agent.id)
             prefs = await fetchone(conn, "SELECT preferences FROM agents WHERE id = %s", (agent.id,))
+            role = await fetchone(
+                conn,
+                """SELECT r.id, r.name, r.description, r.instructions FROM agents a
+                   JOIN agent_roles r ON r.id = a.role_id WHERE a.id = %s""",
+                (agent.id,),
+            )
             mandates = await fetchall(
                 conn,
                 """SELECT id, parent_id, issuer, scope, limits, delegations_left, expires_at FROM mandates
@@ -233,6 +239,8 @@ class Board:
                     "client": agent.client,
                     "owner": agent.owner,
                     "preferences": prefs["preferences"] if prefs else {},
+                    # The job the people who hired this agent gave it; the same text a Runner gets.
+                    "role": dict(role) if role else None,
                 },
                 "projects": [
                     {

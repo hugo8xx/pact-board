@@ -83,8 +83,9 @@ def build_mcp(board: Board) -> MCPServer:
 
     @mcp.tool(title="Who am I")
     async def pact_whoami(ctx: Context) -> dict[str, Any]:
-        """Your agent identity, projects, the mandates you hold, and the agents you can delegate to.
-        Call once at the start of every session."""
+        """Your agent identity and role, projects, the mandates you hold, and the agents you can
+        delegate to. Call once at the start of every session. agent.role.instructions is the job the
+        people who hired you wrote for you: work that way."""
         return await _guard(board.whoami(_agent(ctx)))
 
     @mcp.tool(title="Post a task")
