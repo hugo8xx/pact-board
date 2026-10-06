@@ -52,7 +52,9 @@ async def fetchall(conn: Conn, sql: str, params: Any = None) -> list[DictRow]:
     return await cur.fetchall()
 
 
-async def migrate(pool: AsyncConnectionPool[Conn]) -> list[str]:
+async def migrate(pool: AsyncConnectionPool[Conn], upto: str | None = None) -> list[str]:
+    """Apply the migrations not applied yet, in order. ``upto`` (a file name) stops after that one,
+    so a test can load data the way an older release left it before the next migration runs."""
     applied: list[str] = []
     async with transaction(pool) as conn:
         await conn.execute(
@@ -60,6 +62,8 @@ async def migrate(pool: AsyncConnectionPool[Conn]) -> list[str]:
         )
         done = {r["name"] for r in await fetchall(conn, "SELECT name FROM schema_migrations")}
     for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if upto is not None and path.name > upto:
+            break
         if path.name in done:
             continue
         async with transaction(pool) as conn:
