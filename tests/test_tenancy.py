@@ -7,6 +7,7 @@ ROUTES with how it treats organizations, so a new route cannot ship without deci
 """
 
 import json
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -19,6 +20,7 @@ from pact.board import get_agent
 from pact.db import fetchall, fetchone, transaction
 from pact.errors import PactError
 from pact.keys import b64url
+from pact.mandates import issue_root
 from pact.oauth import ResourceSettings
 
 from .conftest import World
@@ -318,3 +320,65 @@ async def test_an_organization_with_no_log_yet_verifies_nothing(world: World) ->
     async with transaction(world.pool) as conn:
         await conn.execute("INSERT INTO orgs (id, name, system_chain) VALUES ('empty', 'Empty', '_system:empty')")
     assert await world.admin.verify_log("empty") == []
+
+
+# ── the agent (MCP) side ────────────────────────────────────────────────────
+
+
+async def rival_agent(world: World) -> tuple[Any, str]:
+    await world.admin.register_agent("code-acme", by="rex", client="code", projects=["acme"])
+    async with transaction(world.pool) as conn:
+        spy = await get_agent(conn, "code-acme")
+        root = await fetchone(conn, "SELECT root_mandate_id FROM agents WHERE id = 'code-acme'")
+    assert spy and root
+    return spy, str(root["root_mandate_id"])
+
+
+async def test_another_organizations_task_cannot_be_probed_as_a_parent(world: World) -> None:
+    ids = await two_organizations(world)
+    spy, root = await rival_agent(world)
+    missing = "00000000-0000-4000-8000-000000000000"
+    errors = []
+    for parent in (ids["task"], missing):
+        with pytest.raises(PactError) as info:
+            await world.board.list_tasks(spy, mandate_id=root, filter="all", parent_task_id=parent)
+        errors.append((info.value.code, info.value.message.replace(parent, "<id>")))
+    assert errors[0] == errors[1] == ("not_found", "task <id> does not exist")
+
+
+async def test_authority_never_crosses_organizations(world: World) -> None:
+    """A mandate whose root person belongs to another organization than its holder is dead, even
+    if a row like that got into the table some other way."""
+    await two_organizations(world)
+    spy, _ = await rival_agent(world)
+    async with transaction(world.pool) as conn:
+        forged = await issue_root(
+            conn,
+            human="boss",
+            holder="code-acme",
+            scope=["task.read@project:acme"],
+            limits={},
+            delegations=0,
+            expires_at=datetime.now(UTC) + timedelta(days=1),
+        )
+    with pytest.raises(PactError) as info:
+        await world.board.list_tasks(spy, mandate_id=forged.id)
+    assert info.value.code == "chain_broken" and "crosses organizations" in info.value.message
+
+
+async def test_each_organization_keeps_its_own_approval_rules(world: World) -> None:
+    await two_organizations(world)
+    spy, root = await rival_agent(world)
+    code = world.agents["code-web"]
+    boss_task = await world.board.post(
+        code, project_id="web", title="ship", action="deploy.web", mandate_id=world.roots["code-web"]
+    )
+    assert boss_task["status"] == "auth_required"  # the default organization's rules: deploy.* waits
+    # Rival has no rule of its own yet, so the same action goes straight to the board there.
+    rival_deploy = await world.board.post(spy, project_id="acme", title="ship", action="deploy.web", mandate_id=root)
+    assert rival_deploy["status"] == "submitted"
+    async with transaction(world.pool) as conn:
+        await conn.execute("INSERT INTO approval_actions (org_id, action) VALUES ('rival', 'task.work')")
+    rival_task = await world.board.post(spy, project_id="acme", title="x", mandate_id=root)
+    plain = await world.board.post(code, project_id="web", title="x", mandate_id=world.roots["code-web"])
+    assert rival_task["status"] == "auth_required" and plain["status"] == "submitted"

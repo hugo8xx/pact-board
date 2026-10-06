@@ -326,7 +326,7 @@ class Board:
 
             await consume_limits(conn, chain, {"tasks": 1, **(cost or {})})
 
-            needs_approval = await _requires_approval(conn, action)
+            needs_approval = await _requires_approval(conn, action, project.id)
             status = "auth_required" if needs_approval else "submitted"
             task_id = str(uuid4())
             await conn.execute(
@@ -423,7 +423,9 @@ class Board:
                 "all": "true",
             }[filter]
             if parent_task_id:
-                if await _get_task(conn, parent_task_id) is None:
+                # A task in a project this agent cannot read answers as if it did not exist.
+                parent = await _get_task(conn, parent_task_id)
+                if parent is None or parent["project_id"] not in readable:
                     raise PactError("not_found", f"task {parent_task_id} does not exist")
                 where += " AND parent_task_id = %(parent)s"
             params = {
@@ -921,8 +923,13 @@ async def _get_task(conn: Conn, task_id: str) -> dict[str, Any] | None:
     return await fetchone(conn, "SELECT * FROM tasks WHERE id = %s", (task_id,))
 
 
-async def _requires_approval(conn: Conn, action: str) -> bool:
-    rows = await fetchall(conn, "SELECT action FROM approval_actions")
+async def _requires_approval(conn: Conn, action: str, project_id: str) -> bool:
+    """Whether the project's organization makes this action wait for a person's approval."""
+    rows = await fetchall(
+        conn,
+        "SELECT action FROM approval_actions WHERE org_id = (SELECT org_id FROM projects WHERE id = %s)",
+        (project_id,),
+    )
     return any(action_covers(r["action"], action) for r in rows)
 
 
