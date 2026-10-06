@@ -699,6 +699,21 @@ class AdminApi:
             raise PactError("not_found", f"unknown decision {decision}")
         return {"ok": True}
 
+    async def org(self, _r: Request, actor: Actor) -> Any:
+        return await self.admin.org_settings(by=actor.id)
+
+    async def update_org(self, request: Request, actor: Actor) -> Any:
+        b = await _body(request)
+        name, webhook = b.get("name"), b.get("slack_webhook_url")
+        if name is not None and not isinstance(name, str):
+            raise PactError("invalid_request", "name must be text")
+        if webhook is not None and not isinstance(webhook, str):
+            raise PactError("invalid_request", "slack_webhook_url must be text, or null to clear it")
+        clear = "slack_webhook_url" in b and (webhook is None or not webhook.strip())
+        return await self.admin.update_org(
+            by=actor.id, name=name, slack_webhook_url=None if clear else webhook, clear_slack=clear
+        )
+
     async def kill_switch(self, request: Request, actor: Actor) -> Any:
         b = await _body(request)
         await self.admin.set_halted(bool(b.get("halted")), by=actor.id)
@@ -716,6 +731,8 @@ def build_admin_app(pool: AsyncConnectionPool[Conn], verifier: Verifier) -> Star
         routes=[
             Route(f"{p}/signup", a.signup, methods=["POST"]),
             Route(f"{p}/me", r(a.me)),
+            Route(f"{p}/org", r(a.org)),
+            Route(f"{p}/org", r(a.update_org), methods=["PUT"]),
             Route(f"{p}/overview", r(a.overview)),
             Route(f"{p}/humans", r(a.humans)),
             Route(f"{p}/humans", r(a.add_human), methods=["POST"]),

@@ -152,8 +152,8 @@ an active agent's root mandate (the newest one a person issued) or its newest to
 (`PACT_EXPIRY_WARN_HOURS`, default 48) and again once it has expired, since an agent without them simply
 stops. Each warning is sent once, and something that expired more than a day ago is never announced.
 The sender process checks every 10 minutes. Each is written to a
-`notifications` outbox in the same transaction as the event; a sender posts pending rows to Slack
-(`PACT_SLACK_WEBHOOK_URL`), retrying with backoff, so a Slack outage never fails board work. Messages
+`notifications` outbox in the same transaction as the event; a sender posts pending rows to the
+organization's Slack webhook (set by an owner in the Admin UI, `PUT /admin/api/org`), retrying with backoff, so a Slack outage never fails board work. Messages
 carry a redacted, shortened title and first line of detail plus a link to the task, never its body.
 
 A mandate delegated with `pact_post` lives only as long as its task: once the task is completed,
@@ -331,7 +331,7 @@ it, work already delegated under the old one carries on until it expires.
 | `PACT_ROLE` | no | `admin` runs the Admin API service (`pact-admin-api`) instead of the board |
 | `PACT_ADMIN_AUDIENCE` | Admin API service | audience of Admin API tokens; set it to `<board URL>/admin` so tokens stay the same |
 | `PACT_ADMIN_API` | no | default `on`; `off` makes the board stop serving `/admin/api` once the Admin API service is live |
-| `PACT_SLACK_WEBHOOK_URL` | no | a Slack incoming webhook; the process that has it delivers notifications (set it on the Admin API service only) |
+| `PACT_SLACK_WEBHOOK_URL` | no | a Slack incoming webhook for the `default` organization until it sets its own; other organizations set theirs with `PUT /admin/api/org` (only `https://hooks.slack.com/services/…` is accepted). An organization with no webhook is sent nothing |
 | `PACT_ADMIN_UI_URL` | no | the Admin UI's URL, so a notification links to its task, e.g. `https://admin.example.com` |
 | `PACT_EXPORT_FORMAT` | no | `tenuo` or `biscuit`: hand agents with a registered key an outside credential on claim; unset = none |
 | `PACT_EXPORT_TTL_HOURS` | no | default `24`; the longest an exported credential an agent holds lives |

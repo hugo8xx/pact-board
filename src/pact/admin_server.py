@@ -3,7 +3,7 @@
 Same database and code as the board, a separate process. The kill switch, pausing and the audit
 log keep working when the MCP side is overloaded or down, and nothing an agent can reach shares
 a process with what only humans may do. It serves /healthz and /admin/api/* and nothing else.
-With ``PACT_SLACK_WEBHOOK_URL`` set it also delivers notifications to Slack.
+It also delivers notifications to each organization's Slack webhook.
 """
 
 import json

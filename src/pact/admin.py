@@ -1113,6 +1113,43 @@ class Admin:
             )
             return out
 
+    async def org_settings(self, *, by: str) -> dict[str, Any]:
+        """The caller's organization. The Slack webhook is a secret: only whether it is set and a hint."""
+        async with transaction(self.pool) as conn:
+            org = await self._require(conn, by, "viewer")
+            row = await fetchone(
+                conn, "SELECT id, name, halted, slack_webhook_url, terms_version, created_at FROM orgs WHERE id = %s", (org,)
+            )
+        assert row is not None
+        url = row.pop("slack_webhook_url")
+        return {**row, "slack": {"configured": bool(url), "hint": f"…{url[-4:]}" if url else None}}
+
+    async def update_org(
+        self, *, by: str, name: str | None = None, slack_webhook_url: str | None = None, clear_slack: bool = False
+    ) -> dict[str, Any]:
+        """Rename the organization, or set or clear where its Slack notifications go. Owners only."""
+        if name is not None:
+            name = name.strip()
+            if not 1 <= len(name) <= 80:
+                raise PactError("invalid_request", "an organization name is 1 to 80 characters")
+        if slack_webhook_url is not None:
+            slack_webhook_url = slack_webhook_url.strip()
+            # Only Slack's own host, so the board never posts to an address someone else chose.
+            if not re.fullmatch(r"https://hooks\.slack\.com/services/[A-Za-z0-9/_-]{1,200}", slack_webhook_url):
+                raise PactError("invalid_request", "a Slack webhook starts with https://hooks.slack.com/services/")
+        async with transaction(self.pool) as conn:
+            org = await self._require(conn, by, "owner")
+            changed: dict[str, Any] = {}
+            if name is not None:
+                await conn.execute("UPDATE orgs SET name = %s WHERE id = %s", (name, org))
+                changed["name"] = name
+            if clear_slack or slack_webhook_url is not None:
+                await conn.execute("UPDATE orgs SET slack_webhook_url = %s WHERE id = %s", (slack_webhook_url, org))
+                changed["slack"] = "set" if slack_webhook_url else "cleared"  # never the URL itself
+            if changed:
+                await self._log(conn, by, "admin.org.update", changed)
+        return await self.org_settings(by=by)
+
     async def set_halted(self, halted: bool, *, by: str) -> None:
         async with transaction(self.pool) as conn:
             org = await self._require(conn, by, "owner")

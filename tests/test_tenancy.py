@@ -39,6 +39,8 @@ SECRET = "BOSS-ONLY"
 ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/admin/api/signup"): "global",  # makes a new organization; tests/test_signup.py
     ("GET", "/admin/api/me"): "own",
+    ("GET", "/admin/api/org"): "own",
+    ("PUT", "/admin/api/org"): "own",
     ("GET", "/admin/api/overview"): "own",
     ("GET", "/admin/api/humans"): "own",
     ("POST", "/admin/api/humans"): "own",
@@ -162,7 +164,7 @@ async def boss_state(world: World) -> str:
                    WHERE e.org_id = 'default' ORDER BY p.id""",
             ),
             "codes": await fetchall(conn, "SELECT count(*) AS n FROM setup_codes"),
-            "halted": await fetchall(conn, "SELECT halted FROM orgs WHERE id = 'default'"),
+            "org": await fetchall(conn, "SELECT name, halted, slack_webhook_url FROM orgs WHERE id = 'default'"),
         }
     return json.dumps(rows, default=str, sort_keys=True)
 
@@ -179,7 +181,7 @@ async def test_another_organization_sees_and_changes_nothing(
     fmt = credentials.names()[0]
 
     # Lists answer only rival's rows.
-    for path in ("/me", "/overview", "/humans", "/projects", "/agents", "/roles", "/roles?archived=1", "/trusted-roots",
+    for path in ("/me", "/org", "/overview", "/humans", "/projects", "/agents", "/roles", "/roles?archived=1", "/trusted-roots",
                  "/mandates?all=1", "/tasks", "/entries", "/log/verify"):  # fmt: skip
         r = await api(url, "GET", path, rex)
         assert r.status_code == 200, path
@@ -243,6 +245,8 @@ async def test_another_organization_sees_and_changes_nothing(
     assert (await api(url, "POST", "/roles/code/archive", rex)).status_code == 200
     assert (await api(url, "POST", "/humans", rex, {"id": "ria", "name": "Ria", "role": "viewer"})).status_code == 200
     assert (await api(url, "POST", "/kill-switch", rex, {"halted": True})).status_code == 200
+    hook = "https://hooks.slack.com/services/T0/B0/rival"
+    assert (await api(url, "PUT", "/org", rex, {"name": "Rival 2", "slack_webhook_url": hook})).status_code == 200
     # A taken id is refused without saying whose it is.
     taken = await api(url, "POST", "/projects", rex, {"id": "web", "name": "Web"})
     assert taken.status_code == 409 and SECRET not in taken.text
