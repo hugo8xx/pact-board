@@ -299,7 +299,9 @@ async def verify_chain(conn: Conn, leaf_id: str, holder: str, now: datetime | No
               SELECT p.*, c.lvl + 1 FROM mandates p JOIN chain c ON p.id = c.parent_id WHERE c.lvl <= %(max)s
             )
             SELECT {_COLUMNS},
-                   (c.issuer_kind = 'human' AND EXISTS (SELECT 1 FROM humans h WHERE h.id = c.issuer)) AS issuer_is_human
+                   (c.issuer_kind = 'human' AND EXISTS (SELECT 1 FROM humans h WHERE h.id = c.issuer)) AS issuer_is_human,
+                   (SELECT h.org_id FROM humans h WHERE h.id = c.issuer AND c.issuer_kind = 'human') AS issuer_org,
+                   (SELECT a.org_id FROM agents a WHERE a.id = c.holder) AS holder_org
             FROM chain c ORDER BY c.lvl DESC""",
             {"leaf": leaf_id, "max": MAX_DEPTH},
         )
@@ -315,6 +317,10 @@ async def verify_chain(conn: Conn, leaf_id: str, holder: str, now: datetime | No
         raise PactError("chain_broken", f"chain of {leaf_id} is deeper than {MAX_DEPTH} links or has no root", root.id)
     if not rows[0]["issuer_is_human"]:
         raise PactError("chain_broken", f"root mandate {root.id} was not issued by a registered human", root.id)
+    # Authority never crosses organizations: the person at the root and every holder below share one.
+    orgs = {rows[0]["issuer_org"], *(r["holder_org"] for r in rows)}
+    if len(orgs) != 1:
+        raise PactError("chain_broken", f"chain of {leaf_id} crosses organizations", root.id)
 
     for i, m in enumerate(links):
         if not signature_valid(m):
@@ -377,6 +383,7 @@ async def _check_trusted_roots(conn: Conn, links: list[Mandate]) -> None:
             conn,
             """SELECT m.id::text AS mandate_id, r.principal, r.human
                FROM trusted_roots r JOIN mandates m ON m.id = ANY(%s::uuid[]) AND m.created_at >= r.active_since
+               JOIN agents a ON a.id = m.holder AND a.org_id = r.org_id
                WHERE r.principal = ANY(%s) AND r.revoked_at IS NULL""",
             ([m.id for m in imported], principals),
         )
