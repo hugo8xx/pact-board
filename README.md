@@ -258,6 +258,10 @@ cannot push to anyone. One process per runner agent, on a machine that has a log
    - Only the tools in the allowlist, with `--permission-mode default`; never
      `--dangerously-skip-permissions`.
    - Only project settings (`--setting-sources project`), so a person's own allow rules never reach it.
+   - The owner's CLAUDE.md does reach it: that setting would otherwise hide `~/.claude/CLAUDE.md`, so
+     the Runner reads the files in `PACT_RUNNER_CONTEXT_FILES` (default `~/.claude/CLAUDE.md`, `none`
+     to turn it off) for every new session and puts them into the role. Only the text goes in, no
+     settings, permissions or hooks. A missing file is skipped.
    - A PreToolUse guard (`pact-runner-guard`) refuses pushes to `main`/`master`/`stage`/`staging`/`release`,
      force pushes and `gh pr merge`. Branch protection on the host is still the hard stop.
    - The board as an MCP server, minus `pact_claim`/`pact_report`/`pact_defer`/`pact_revoke`. The session
