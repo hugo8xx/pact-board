@@ -223,8 +223,8 @@ agent tokens only. The script reports what the board cannot see in `X-Pact-Auto-
 ## Hiring agents
 
 People hire agents from **roles** instead of registering them by hand. A role is a job description
-kept in the Admin UI (`agent_roles`; seven ship with the board: chat, code, runner, worker, secretary,
-design, cowork). It says what the agent can do, the project-relative actions its mandate grants
+kept in the Admin UI (`agent_roles`; eight ship with the board: chat, code, gemini, runner, worker,
+secretary, design, cowork). It says what the agent can do, the project-relative actions its mandate grants
 (e.g. `task.work`), its budget (`limits`), how far it may delegate, how long its mandate and token
 last, and, for a Runner, the `PACT_RUNNER_*` settings and instructions its machine runs with.
 
