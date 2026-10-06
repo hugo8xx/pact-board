@@ -36,6 +36,28 @@ from .scope import board_scope, is_valid_scope
 Role = Literal["owner", "approver", "viewer"]
 _RANK: dict[str, int] = {"viewer": 0, "approver": 1, "owner": 2}
 
+# What a new organization's owners must approve before an agent may do it, as the first one started.
+_APPROVAL_DEFAULTS = ("deploy.*", "finance.*", "customer.message")
+
+
+def _slug(text: str, length: int) -> str:
+    """Lowercase letters, digits and single dashes; empty when nothing usable is left (a Thai name)."""
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", text.lower())).strip("-")[:length].strip("-")
+
+
+async def _seed_org(conn: Conn, org: str) -> None:
+    """A new organization's roles (copied from role_templates) and approval rules."""
+    await conn.execute(
+        """INSERT INTO agent_roles (org_id, id, name, description, client, actions, limits, delegations,
+                                    mandate_days, token_days, settings, instructions, position)
+           SELECT %s, id, name, description, client, actions, limits, delegations, mandate_days, token_days,
+                  settings, instructions, position FROM role_templates""",
+        (org,),
+    )
+    for action in _APPROVAL_DEFAULTS:
+        await conn.execute("INSERT INTO approval_actions (org_id, action) VALUES (%s, %s)", (org, action))
+
+
 # How to tell that a row a person names belongs to their organization. Anything else answers
 # not_found with the same words as a row that does not exist, so ids of other organizations
 # cannot be probed.
@@ -161,6 +183,73 @@ class Admin:
                 (human_id, name, role, email, org),
             )
             await self._log(conn, by or human_id, "admin.human.add", {"id": human_id, "role": role, "email": email})
+
+    async def sign_up(
+        self,
+        *,
+        issuer: str,
+        sub: str,
+        email: str,
+        org_name: str,
+        display_name: str,
+        terms_version: str,
+        max_per_hour: int,
+    ) -> dict[str, Any]:
+        """A new person starts their own organization and becomes its owner. Someone already invited by
+        email joins the organization that invited them instead; no new organization is made."""
+        org_name, display_name, terms_version = org_name.strip(), display_name.strip(), terms_version.strip()
+        if not 1 <= len(org_name) <= 80:
+            raise PactError("invalid_request", "an organization name is 1 to 80 characters")
+        if not 1 <= len(display_name) <= 80:
+            raise PactError("invalid_request", "your name is 1 to 80 characters")
+        if not 1 <= len(terms_version) <= 64:
+            raise PactError("invalid_request", "say which version of the terms you accepted")
+        async with transaction(self.pool) as conn:
+            # One sign-up at a time per account, so two clicks make one organization.
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"signup:{issuer}:{sub}",))
+            row = await fetchone(
+                conn,
+                """SELECT id, org_id, disabled_at, auth_sub FROM humans
+                   WHERE (auth_issuer = %s AND auth_sub = %s) OR (lower(email) = lower(%s))
+                   ORDER BY auth_sub IS NULL LIMIT 1 FOR UPDATE""",
+                (issuer, sub, email),
+            )
+            if row and row["disabled_at"] is not None:
+                raise PactError("account_disabled", "this account has been disabled; ask the owner of your organization")
+            if row and row["auth_sub"] is not None:
+                if row["auth_sub"] == sub:
+                    raise PactError("already_registered", "this account already belongs to an organization")
+                raise PactError("already_registered", "this email already belongs to another sign-in")
+            if row:  # invited and signing in for the first time
+                await conn.execute("UPDATE humans SET auth_issuer = %s, auth_sub = %s WHERE id = %s", (issuer, sub, row["id"]))
+                return {"human": row["id"], "org": await self._org_summary(conn, str(row["org_id"])), "invited": True}
+            recent = await fetchone(
+                conn, "SELECT count(*) AS n FROM orgs WHERE created_at > now() - interval '1 hour' AND created_by IS NOT NULL"
+            )
+            if recent and recent["n"] >= max_per_hour:
+                raise PactError("signup_busy", "too many organizations were created in the last hour; try again later")
+            org = f"{_slug(org_name, 30) or 'org'}-{secrets.token_hex(3)}"
+            human = _slug(email.split("@")[0], 30) or "owner"
+            if await fetchone(conn, "SELECT 1 FROM humans WHERE id = %s", (human,)):
+                human = f"{human}-{secrets.token_hex(2)}"
+            await conn.execute(
+                """INSERT INTO orgs (id, name, system_chain, terms_version, terms_accepted_at, created_by)
+                   VALUES (%s, %s, %s, %s, now(), %s)""",
+                (org, org_name, f"_system:{org}", terms_version, human),
+            )
+            await conn.execute(
+                """INSERT INTO humans (id, name, role, email, org_id, auth_issuer, auth_sub)
+                   VALUES (%s, %s, 'owner', %s, %s, %s, %s)""",
+                (human, display_name, email, org, issuer, sub),
+            )
+            await _seed_org(conn, org)
+            await self._log(conn, human, "org.created", {"org": org, "name": org_name, "terms_version": terms_version})
+            return {"human": human, "org": await self._org_summary(conn, org), "invited": False}
+
+    async def _org_summary(self, conn: Conn, org: str) -> dict[str, Any]:
+        row = await fetchone(conn, "SELECT id, name, halted FROM orgs WHERE id = %s", (org,))
+        assert row is not None
+        return dict(row)
 
     async def update_human(
         self,

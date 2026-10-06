@@ -282,6 +282,17 @@ organization answers `not_found` with the same words as an id that does not exis
   organization that existed before migration 019 keeps the `_system` chain, because a chain's key is
   part of every entry's hash.
 
+### Signing up
+
+With `PACT_SIGNUP_ENABLED=true`, someone who signs in but is not on the board yet can start their own
+organization: `POST /admin/api/signup {org_name, display_name, accept_terms: true, terms_version}`.
+They become its owner; the organization gets the roles in `role_templates` and the default approval
+rules, and its first log entry is `org.created`. Someone an owner invited by email joins that
+organization the first time they sign in instead, and never makes a new one. Until they sign up, the
+Admin API answers `not_registered`; a disabled person gets `account_disabled`.
+`PACT_SIGNUP_MAX_PER_HOUR` (default 30) stops sign-ups for a while when more organizations than that
+were made in the last hour (`signup_busy`). It is a circuit breaker, not a limit on organizations.
+
 ## Admin API
 
 `/admin/api/*` is for people, not agents: it takes an OAuth access token whose audience is

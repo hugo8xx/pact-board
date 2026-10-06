@@ -534,5 +534,5 @@ async def test_the_connection_is_for_people_and_known_agents(
     r = await api(url, "GET", "/agents/nobody/connection", admin_token(issuer, settings, who="vic"))
     assert r.status_code == 404 and r.json()["error"] == "not_found"
     r = await api(url, "GET", "/agents/code-web/connection", admin_token(issuer, settings, who="stranger"))
-    assert r.status_code == 403 and r.json()["error"] == "forbidden"
+    assert r.status_code == 403 and r.json()["error"] == "not_registered"
     assert (await api(url, "GET", "/agents/code-web/connection", None)).status_code == 401

@@ -6,6 +6,7 @@ through `Admin`, which checks the caller's role and logs the action.
 """
 
 import json
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,7 +26,7 @@ from .admin import Admin
 from .board import TERMINAL_STATUSES, export_format
 from .db import Conn, fetchall, fetchone, transaction
 from .errors import PactError
-from .oauth import TokenRejected, Verifier, human_for
+from .oauth import TokenRejected, Verifier, sign_in
 
 
 @dataclass(frozen=True)
@@ -48,7 +49,31 @@ _STATUS = {
     "limit_exceeded": 400,
     "note_pinned": 409,
     "id_taken": 409,
+    "not_registered": 403,
+    "account_disabled": 403,
+    "already_registered": 409,
+    "signup_closed": 403,
+    "signup_busy": 429,
 }
+
+_NOT_REGISTERED = {
+    "error": "not_registered",
+    "message": "this account is not a registered person on the board; sign up or ask an owner to invite you",
+}
+_DISABLED = {"error": "account_disabled", "message": "this account has been disabled; ask the owner of your organization"}
+
+
+def signup_enabled() -> bool:
+    """Self-service sign-up is off unless PACT_SIGNUP_ENABLED says otherwise."""
+    return os.environ.get("PACT_SIGNUP_ENABLED", "").strip().lower() in ("1", "true", "yes")
+
+
+def signup_max_per_hour() -> int:
+    """A circuit breaker against a flood of sign-ups, not a cap on organizations."""
+    try:
+        return max(0, int(os.environ.get("PACT_SIGNUP_MAX_PER_HOUR", "30")))
+    except ValueError:
+        return 30
 
 
 def _jsonable(value: Any) -> Any:
@@ -108,21 +133,67 @@ class AdminApi:
             try:
                 claims = await self.verifier.verify_admin(token)
                 async with transaction(self.pool) as conn:
-                    human = await human_for(conn, self.verifier, token, claims)
+                    who = await sign_in(conn, self.verifier, token, claims)
             except TokenRejected as err:
                 return _ok({"error": "unauthorized", "message": str(err)}, 401)
-            if human is None:
-                return _ok({"error": "forbidden", "message": "this account is not a registered person on the board"}, 403)
+            if who.human is None:
+                return _ok(_NOT_REGISTERED, 403)
+            if who.disabled:
+                return _ok(_DISABLED, 403)
             async with transaction(self.pool) as conn:
-                row = await fetchone(conn, "SELECT org_id FROM humans WHERE id = %s", (human,))
+                row = await fetchone(conn, "SELECT org_id FROM humans WHERE id = %s", (who.human,))
             if row is None:
-                return _ok({"error": "forbidden", "message": "this account is not a registered person on the board"}, 403)
+                return _ok(_NOT_REGISTERED, 403)
+            human = who.human
             try:
                 return _ok(await fn(request, Actor(human, str(row["org_id"]))))
             except PactError as err:
                 return _ok(err.to_dict(), _STATUS.get(err.code, 409))
 
         return endpoint
+
+    async def signup(self, request: Request) -> Response:
+        """POST /signup: someone signed in but not yet on the board starts an organization. It cannot go
+        through route(), which turns such a caller away."""
+        auth = request.headers.get("authorization", "")
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if not token or token.startswith("pact_"):
+            return _ok({"error": "unauthorized", "message": "the Admin API takes a person's OAuth token"}, 401)
+        try:
+            claims = await self.verifier.verify_admin(token)
+            async with transaction(self.pool) as conn:
+                who = await sign_in(conn, self.verifier, token, claims)
+        except TokenRejected as err:
+            return _ok({"error": "unauthorized", "message": str(err)}, 401)
+        if who.disabled:
+            return _ok(_DISABLED, 403)
+        if who.human is not None:
+            return _ok({"error": "already_registered", "message": "this account already belongs to an organization"}, 409)
+        if not signup_enabled():
+            return _ok({"error": "signup_closed", "message": "sign-up is not open yet"}, 403)
+        if not who.email:
+            return _ok({"error": "invalid_request", "message": "this sign-in has no verified email"}, 400)
+        body = await _body(request)
+        if body.get("accept_terms") is not True:
+            return _ok({"error": "invalid_request", "message": "accept the terms to sign up"}, 400)
+        fields = {k: body.get(k) for k in ("org_name", "display_name", "terms_version")}
+        if not all(isinstance(v, str) for v in fields.values()):
+            return _ok({"error": "invalid_request", "message": "org_name, display_name and terms_version are required"}, 400)
+        issuer = self.verifier.settings.issuer
+        assert issuer, "verify_admin accepted a token with no issuer configured"
+        try:
+            out = await self.admin.sign_up(
+                issuer=issuer,
+                sub=str(claims["sub"]),
+                email=who.email,
+                org_name=str(fields["org_name"]),
+                display_name=str(fields["display_name"]),
+                terms_version=str(fields["terms_version"]),
+                max_per_hour=signup_max_per_hour(),
+            )
+        except PactError as err:
+            return _ok(err.to_dict(), _STATUS.get(err.code, 409))
+        return _ok(out, 201)
 
     # ── reads (any role) ─────────────────────────────────────────────────────
 
@@ -643,6 +714,7 @@ def build_admin_app(pool: AsyncConnectionPool[Conn], verifier: Verifier) -> Star
     p = "/admin/api"
     return Starlette(
         routes=[
+            Route(f"{p}/signup", a.signup, methods=["POST"]),
             Route(f"{p}/me", r(a.me)),
             Route(f"{p}/overview", r(a.overview)),
             Route(f"{p}/humans", r(a.humans)),
