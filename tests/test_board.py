@@ -70,6 +70,17 @@ async def test_design_agents_claim_and_report_design_work(world: World) -> None:
     assert out["status"] == "completed"
 
 
+async def test_cowork_agents_post_their_own_work_and_do_it(world: World) -> None:
+    """Cowork does desk work for a person (research, reports), so it claims tasks like Design does."""
+    await setup_web(world)
+    cowork = await world.agent("cowork-web", "cowork", ["web"])
+    root = world.roots["cowork-web"]
+    t = await world.board.post(cowork, project_id="web", title="weekly report", mandate_id=root)
+    await world.board.claim(cowork, task_id=t["task_id"], mandate_id=root)
+    out = await world.board.report(cowork, task_id=t["task_id"], status="completed", mandate_id=root, result=HANDOFF)
+    assert out["status"] == "completed"
+
+
 # ── mandate rules ─────────────────────────────────────────────────────────────
 
 
