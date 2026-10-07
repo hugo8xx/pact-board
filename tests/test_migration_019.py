@@ -88,7 +88,7 @@ async def test_an_existing_board_moves_into_the_default_organization(old_board: 
         for chain, project in (("_system", None), ("web", "web"), ("web", "web"), ("_system", None)):
             await _old_entry(conn, chain, project, "test.action")
 
-    assert await migrate(pool) == ["019_orgs.sql"]  # type: ignore[arg-type]
+    assert await migrate(pool, upto="019_orgs.sql") == ["019_orgs.sql"]  # type: ignore[arg-type]
 
     async with transaction(pool) as conn:  # type: ignore[arg-type]
         org = await fetchone(conn, "SELECT id, name, halted, system_chain FROM orgs")
@@ -120,7 +120,9 @@ async def test_an_agent_cannot_join_a_project_of_another_organization(old_board:
         await conn.execute("INSERT INTO projects (id, name, created_by, org_id) VALUES ('rival-web', 'R', 'boss', 'rival')")
     with pytest.raises(psycopg.errors.ForeignKeyViolation):
         async with transaction(pool) as conn:  # type: ignore[arg-type]
-            await conn.execute("INSERT INTO agent_projects (agent_id, project_id) VALUES ('code-web', 'rival-web')")
+            await conn.execute(
+                "INSERT INTO agent_projects (agent_id, project_id, org_id) VALUES ('code-web', 'rival-web', 'default')"
+            )
     with pytest.raises(psycopg.errors.ForeignKeyViolation):
         async with transaction(pool) as conn:  # type: ignore[arg-type]
             # A role of another organization cannot be given to an agent.
