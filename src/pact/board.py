@@ -37,7 +37,7 @@ Client = Literal["chat", "cowork", "design", "code", "gemini", "runner"]
 ListFilter = Literal["mine", "open", "done", "all"]
 ReportStatus = Literal["working", "completed", "failed", "canceled", "input_required"]
 
-POST_ONLY_CLIENTS: tuple[Client, ...] = ("chat", "cowork")
+POST_ONLY_CLIENTS: tuple[Client, ...] = ("chat",)
 WAKELESS_CLIENTS: tuple[Client, ...] = ("chat", "cowork", "design")
 """Clients that work only while a person has them open: nothing can wake them for a task."""
 
