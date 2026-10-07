@@ -45,6 +45,23 @@ def _slug(text: str, length: int) -> str:
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", text.lower())).strip("-")[:length].strip("-")
 
 
+async def _system_entry(conn: Conn, org: str, action: str, payload: Any) -> None:
+    await append_entry(
+        conn,
+        EntryInput(
+            project_id=None,
+            task_id=None,
+            agent_id=None,
+            actor="system",
+            mandate_chain=[],
+            action=action,
+            payload=payload,
+            outcome="ok",
+            org_id=org,
+        ),
+    )
+
+
 async def _seed_org(conn: Conn, org: str) -> None:
     """A new organization's roles (copied from role_templates) and approval rules."""
     await conn.execute(
@@ -1333,6 +1350,48 @@ class Admin:
                 )
             ]
             return [(await verify_entry_chain(conn, k)).__dict__ for k in keys]
+
+    # ── platform operator (the pact-admin CLI only; never reachable from the Admin API) ─────────
+
+    async def list_orgs(self) -> list[dict[str, Any]]:
+        """Every organization with how big it is. No people's names or emails."""
+        async with transaction(self.pool) as conn:
+            return await fetchall(
+                conn,
+                """SELECT o.id, o.name, o.halted, o.terms_version, o.created_at,
+                          (SELECT count(*) FROM humans h WHERE h.org_id = o.id AND h.disabled_at IS NULL) AS people,
+                          (SELECT count(*) FROM projects p WHERE p.org_id = o.id) AS projects,
+                          (SELECT count(*) FROM agents a WHERE a.org_id = o.id) AS agents
+                   FROM orgs o ORDER BY o.created_at""",
+            )
+
+    async def platform_update_org(self, org: str, *, name: str | None = None, halted: bool | None = None) -> dict[str, Any]:
+        """Rename or halt one organization as the platform's operator. Written to that organization's
+        own log as the system, so its owners can see what was done to them."""
+        if name is not None and not 1 <= len(name.strip()) <= 80:
+            raise PactError("invalid_request", "an organization name is 1 to 80 characters")
+        async with transaction(self.pool) as conn:
+            row = await fetchone(conn, "SELECT id FROM orgs WHERE id = %s FOR UPDATE", (org,))
+            if row is None:
+                raise PactError("not_found", f"organization {org} does not exist")
+            changed: dict[str, Any] = {}
+            if name is not None:
+                await conn.execute("UPDATE orgs SET name = %s WHERE id = %s", (name.strip(), org))
+                changed["name"] = name.strip()
+            if halted is not None:
+                await conn.execute("UPDATE orgs SET halted = %s WHERE id = %s", (halted, org))
+                changed["halted"] = halted
+            if changed:
+                await _system_entry(conn, org, "platform.org.update", changed)
+            return await self._org_summary(conn, org)
+
+    async def platform_halt(self, halted: bool) -> None:
+        """The platform-wide kill switch: stops every organization's agents. Each organization's log
+        says so, since it stops their work too."""
+        async with transaction(self.pool) as conn:
+            await conn.execute("UPDATE system_state SET halted = %s", (halted,))
+            for row in await fetchall(conn, "SELECT id FROM orgs ORDER BY id"):
+                await _system_entry(conn, str(row["id"]), "platform.halt", {"halted": halted})
 
     async def write_note(
         self, project_id: str, key: str, *, by: str, title: str | None = None, body: str | None = None, archive: bool = False

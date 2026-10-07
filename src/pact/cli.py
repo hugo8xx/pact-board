@@ -1,6 +1,7 @@
 """`pact-admin`: the human-side commands until the Admin UI exists (phase 3).
 
-Every command except `migrate` and the first `human add` needs `--by <human-id>`.
+Every command except `migrate`, the first `human add` and the platform operator's commands
+(`org-*`, `platform-*`, `log-verify`) needs `--by <human-id>`.
 """
 
 import argparse
@@ -122,8 +123,18 @@ def _parser() -> argparse.ArgumentParser:
     pe.add_argument("entry_id", type=int)
     pe.add_argument("--by", required=True)
 
-    lv = sub.add_parser("log-verify", help="recompute the entry hash chains")
-    lv.add_argument("--chain")
+    lv = sub.add_parser("log-verify", help="recompute the entry hash chains of one organization, or of all")
+    lv.add_argument("--org", help="the organization (default: every one)")
+
+    # The platform's operator: whoever can run this CLI against the database. No --by.
+    sub.add_parser("org-list", help="every organization and how big it is")
+    orn = sub.add_parser("org-rename", help="rename an organization")
+    orn.add_argument("id")
+    orn.add_argument("name")
+    for name in ("org-halt", "org-unhalt"):
+        sub.add_parser(name, help="stop or restart one organization's agents").add_argument("id")
+    sub.add_parser("platform-halt", help="stop every organization's agents")
+    sub.add_parser("platform-unhalt", help="restart them (each organization's own switch still applies)")
     return p
 
 
@@ -201,7 +212,16 @@ async def _run(args: argparse.Namespace) -> Any:
             case "payload-erase":
                 return {"erased": await a.erase_payload(args.entry_id, by=args.by)}
             case "log-verify":
-                return await a.verify_log(args.chain)
+                orgs = [args.org] if args.org else [str(o["id"]) for o in await a.list_orgs()]
+                return {org: await a.verify_log(org) for org in orgs}
+            case "org-list":
+                return await a.list_orgs()
+            case "org-rename":
+                return await a.platform_update_org(args.id, name=args.name)
+            case "org-halt" | "org-unhalt":
+                return await a.platform_update_org(args.id, halted=args.cmd == "org-halt")
+            case "platform-halt" | "platform-unhalt":
+                await a.platform_halt(args.cmd == "platform-halt")
         return {"ok": True}
     finally:
         await pool.close()

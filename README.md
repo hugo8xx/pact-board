@@ -281,6 +281,11 @@ organization answers `not_found` with the same words as an id that does not exis
 - **Log:** entries with no project go to the organization's own chain (`orgs.system_chain`). The
   organization that existed before migration 019 keeps the `_system` chain, because a chain's key is
   part of every entry's hash.
+- **The platform's operator** (whoever can run `pact-admin` against the database) has commands no
+  Admin API route reaches: `org-list` (sizes only, no people), `org-rename <id> <name>`,
+  `org-halt <id>` / `org-unhalt <id>`, and `platform-halt` / `platform-unhalt`, the switch that stops
+  every organization. Each writes to the affected organizations' own logs as `system`, so their owners
+  see what was done to them. `log-verify` checks every organization's chains, or one with `--org`.
 
 ### Signing up
 
