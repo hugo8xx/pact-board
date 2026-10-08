@@ -4,7 +4,9 @@ Hooks are shell commands, not MCP clients, so they get two small endpoints inste
 Each takes the JSON Claude Code writes to the hook's stdin, verbatim, and an agent token:
 
 - ``post-tool-use`` logs what Claude Code just did (a shell command, a file edit) as an Entry on
-  the task the agent is working on. Secrets are redacted before anything is stored.
+  the task the agent is working on. Secrets are redacted before anything is stored. Unread
+  messages to the agent come back as ``additionalContext``, so Claude sees an answer from another
+  agent while it works; ``user-prompt-submit`` does the same when the person types.
 - ``stop`` answers in the hook output format: a ``systemMessage`` for the person when open tasks
   arrived since this session last looked, else ``{}``. It never claims anything.
 - ``session-start`` shows the person the open tasks when a session opens. It never claims.
@@ -22,7 +24,7 @@ from typing import Any
 from starlette.requests import Request
 from starlette.types import Receive, Scope, Send
 
-from .board import Agent, AutoClaimGate, Board
+from .board import MESSAGE_FRAME, Agent, AutoClaimGate, Board
 from .errors import PactError
 from .redact import redact_text
 
@@ -138,6 +140,25 @@ def auto_claim_output(agent_id: str, outcome: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def messages_context(messages: list[dict[str, Any]]) -> str:
+    """Unread messages, framed as data from other agents for Claude's context."""
+    lines = [f"[PACT board] {len(messages)} new message(s) for you from other agents or people. {MESSAGE_FRAME}"]
+    for m in messages:
+        lines.append(f"- From {m['from']} on task {m['task_id']} ({m['task_title'][:80]!r}): {_clip_body(m['body'])}")
+    lines.append("Answer with pact_message on the same task if they asked you something.")
+    return "\n".join(lines)
+
+
+def with_messages(out: dict[str, Any], event: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Add messages to a hook answer's additionalContext, after anything already there."""
+    if not messages:
+        return out
+    hso = dict(out.get("hookSpecificOutput") or {"hookEventName": event})
+    hso["additionalContext"] = "\n\n".join(filter(None, [hso.get("additionalContext"), messages_context(messages)]))
+    note = f"PACT: {len(messages)} new message(s) handed to Claude."
+    return {**out, "hookSpecificOutput": hso, "systemMessage": "\n".join(filter(None, [out.get("systemMessage"), note]))}
+
+
 def _header(scope: Scope, name: bytes) -> str:
     for key, value in scope.get("headers", []):
         if key == name:
@@ -177,14 +198,16 @@ async def handle(scope: Scope, receive: Receive, send: Send, board: Board, agent
 
     try:
         if event == "post-tool-use":
-            await _respond(send, 200, await board.record_tool_use(agent, summarize_tool_use(hook)))
+            logged = await board.record_tool_use(agent, summarize_tool_use(hook))
+            await _respond(send, 200, with_messages(logged, "PostToolUse", await board.take_messages_for_hook(agent)))
             return
         session_id = str(hook.get("session_id") or "")[:200]
         if not session_id:
             await _respond(send, 400, {"error": "invalid_request", "message": "session_id is required"})
             return
         if event == "user-prompt-submit":
-            await _respond(send, 200, auto_claim_output(agent.id, await board.auto_claim(agent, gate_from(scope, hook))))
+            out = auto_claim_output(agent.id, await board.auto_claim(agent, gate_from(scope, hook)))
+            await _respond(send, 200, with_messages(out, "UserPromptSubmit", await board.take_messages_for_hook(agent)))
             return
         listed = await board.new_tasks_for_session(agent, session_id)
         message = session_start_message if event == "session-start" else stop_message

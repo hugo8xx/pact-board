@@ -25,7 +25,9 @@ from .entries import DEFAULT_ORG
 from .redact import redact_text
 from .slack_cards import card, clean_report
 
-Kind = Literal["approval_needed", "deferred", "question", "task_closed", "awaiting_session", "brief", "expiring", "expired"]
+Kind = Literal[
+    "approval_needed", "deferred", "question", "task_closed", "awaiting_session", "brief", "expiring", "expired", "message"
+]
 
 TITLE_MAX = 200
 DETAIL_MAX = 300
@@ -45,6 +47,7 @@ _HEADLINES: dict[str, str] = {
     "brief": "รายงานประจำวัน",
     "expiring": "ใกล้หมดอายุ",
     "expired": "หมดอายุแล้ว agent หยุดทำงาน",
+    "message": "agent ส่งข้อความถึงคุณ",
 }
 
 

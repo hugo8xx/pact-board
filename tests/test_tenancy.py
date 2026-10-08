@@ -164,6 +164,7 @@ async def boss_state(world: World) -> str:
                    WHERE e.org_id = 'default' ORDER BY p.id""",
             ),
             "codes": await fetchall(conn, "SELECT count(*) AS n FROM setup_codes"),
+            "messages": await fetchall(conn, "SELECT count(*) AS n FROM task_messages"),
             "org": await fetchall(conn, "SELECT name, halted, slack_webhook_url FROM orgs WHERE id = 'default'"),
         }
     return json.dumps(rows, default=str, sort_keys=True)
@@ -225,6 +226,7 @@ async def test_another_organization_sees_and_changes_nothing(
         ("POST", f"/tasks/{t}/release", None),
         ("POST", f"/tasks/{t}/edit", {"title": "pwned"}),
         ("POST", f"/tasks/{t}/cancel", None),
+        ("POST", f"/tasks/{t}/message", {"body": "pwned", "to": "code-web"}),
         ("POST", f"/tasks/{t}/approve", None),
         ("POST", f"/tasks/{t}/resume", {"answer": "x"}),
         ("POST", f"/entries/{ids['entry']}/erase", None),
@@ -349,6 +351,23 @@ async def test_another_organizations_task_cannot_be_probed_as_a_parent(world: Wo
             await world.board.list_tasks(spy, mandate_id=root, filter="all", parent_task_id=parent)
         errors.append((info.value.code, info.value.message.replace(parent, "<id>")))
     assert errors[0] == errors[1] == ("not_found", "task <id> does not exist")
+
+
+async def test_another_organizations_task_takes_no_messages_and_shows_no_thread(world: World) -> None:
+    ids = await two_organizations(world)
+    spy, root = await rival_agent(world)
+    missing = "00000000-0000-4000-8000-000000000000"
+    for body in (None, "hello", "x"):
+        errors = []
+        for task in (ids["task"], missing):
+            with pytest.raises(PactError) as info:
+                await world.board.message(spy, task_id=task, mandate_id=root, body=body, to="code-web" if body == "x" else None)
+            errors.append((info.value.code, info.value.message.replace(task, "<id>")))
+        assert errors[0] == errors[1] == ("not_found", "task <id> does not exist")
+    for call in (world.board.claim(spy, task_id=ids["task"], mandate_id=root),):
+        with pytest.raises(PactError) as info:
+            await call
+        assert info.value.code == "not_found"
 
 
 async def test_authority_never_crosses_organizations(world: World) -> None:

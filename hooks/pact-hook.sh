@@ -1,7 +1,7 @@
 #!/bin/sh
 # PACT Board hook for Claude Code. Forwards the hook's stdin JSON to the board.
 #
-#   pact-hook.sh <agent-id> post-tool-use        # log a shell command or file edit on the task in hand
+#   pact-hook.sh <agent-id> post-tool-use        # log a shell command or file edit; hand Claude new messages
 #   pact-hook.sh <agent-id> stop                 # tell the person about new tasks; never claims
 #   pact-hook.sh <agent-id> session-start        # show the open tasks when a session opens; never claims
 #   pact-hook.sh <agent-id> user-prompt-submit   # auto-claim one delegated task, only if every condition holds
@@ -45,6 +45,11 @@ out=$(curl -sS -m 5 -X POST \
   -H "X-Pact-Git-Clean: $clean" \
   --data-binary @- "$PACT_URL/hooks/a/$agent/$event" 2>/dev/null) || exit 0
 
-# The post-tool-use receipt stays quiet; the other events answer in hook output format.
-[ "$event" != "post-tool-use" ] && printf '%s\n' "$out"
+# The post-tool-use receipt stays quiet unless it carries messages for Claude; the other events
+# answer in hook output format.
+case "$event:$out" in
+  post-tool-use:*hookSpecificOutput*) printf '%s\n' "$out" ;;
+  post-tool-use:*) ;;
+  *) printf '%s\n' "$out" ;;
+esac
 exit 0

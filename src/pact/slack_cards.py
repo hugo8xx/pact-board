@@ -22,6 +22,7 @@ ICONS: dict[str, str] = {
     "brief": "📋",
     "expiring": "⏳",
     "expired": "⛔",
+    "message": "💬",
 }
 
 MAX_BLOCKS = 50

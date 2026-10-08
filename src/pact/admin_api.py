@@ -426,7 +426,13 @@ class AdminApi:
                    FROM mandates WHERE id = ANY(%s::uuid[]) AND holder IN (SELECT id FROM agents WHERE org_id = %s)""",
                 (ids, actor.org),
             )
-        return {"task": task, "entries": entries, "mandates": mandates}
+            messages = await fetchall(
+                conn,
+                """SELECT id, from_agent, from_human, to_agent, body, created_at, read_at
+                   FROM task_messages WHERE task_id = %s ORDER BY id""",
+                (task["id"],),
+            )
+        return {"task": task, "entries": entries, "mandates": mandates, "messages": messages}
 
     async def entries(self, request: Request, actor: Actor) -> Any:
         q = request.query_params
@@ -692,6 +698,12 @@ class AdminApi:
         elif decision == "edit":
             b = await _body(request)
             return await self.admin.edit_task(task_id, by=actor.id, title=b.get("title"), body=b.get("body"))
+        elif decision == "message":
+            b = await _body(request)
+            body, to = b.get("body"), b.get("to")
+            if not isinstance(body, str) or (to is not None and not isinstance(to, str)):
+                raise PactError("invalid_request", "send {body, to?} as text")
+            return {"ok": True, **await self.admin.send_message(task_id, by=actor.id, body=body, to=to)}
         elif decision == "cancel":
             reason = (await _body(request)).get("reason") or None
             return {"ok": True, **await self.admin.cancel_task(task_id, by=actor.id, reason=reason)}
