@@ -21,7 +21,18 @@ from .conftest import World
 
 pytestmark = pytest.mark.anyio
 
-TOOLS = {"pact_whoami", "pact_post", "pact_list", "pact_claim", "pact_report", "pact_defer", "pact_revoke", "pact_note"}
+TOOLS = {
+    "pact_whoami",
+    "pact_post",
+    "pact_list",
+    "pact_claim",
+    "pact_report",
+    "pact_defer",
+    "pact_revoke",
+    "pact_note",
+    "pact_message",
+    "pact_wait",
+}
 
 
 @pytest.fixture
@@ -54,7 +65,7 @@ def payload(result: Any) -> dict[str, Any]:
     return json.loads(result.content[0].text)
 
 
-async def test_mcp_client_sees_eight_tools_and_works_end_to_end(world: World, server_url: str) -> None:
+async def test_mcp_client_sees_every_tool_and_works_end_to_end(world: World, server_url: str) -> None:
     await world.project("web")
     await world.agent("chat-boss", "chat", ["web"])
     await world.agent("code-web", "code", ["web"])

@@ -8,7 +8,7 @@ to a human, checked on every call, narrowing at each hand-off, revocable at any 
 
 | Piece | What it is |
 | --- | --- |
-| `pact-board` (this repo) | the MCP server: 8 tools, project context, mandates, the append-only hash-chained log |
+| `pact-board` (this repo) | the MCP server: 10 tools, project context, mandates, the append-only hash-chained log |
 | An OAuth 2.1 authorization server | signs people in for the hosted Claude apps. Bring any that issues JWT access tokens with a JWKS and supports CIMD or DCR (Keycloak, WorkOS, Auth0, …) |
 | Agent tokens | `pact_…` bearer tokens for Claude Code, Gemini CLI, hooks and the Runner — no OAuth needed |
 | [`pact-admin`](https://github.com/hugo8xx/pact-admin) (separate repo) | the Admin UI (Next.js, on Vercel). It calls the board's Admin API at `/admin/api` |
@@ -24,7 +24,21 @@ design agent's URL, and Chat sees it too.
 
 ## Tools
 
-`pact_whoami` · `pact_post` · `pact_list` · `pact_claim` · `pact_report` · `pact_defer` · `pact_revoke` · `pact_note`.
+`pact_whoami` · `pact_post` · `pact_list` · `pact_claim` · `pact_report` · `pact_defer` · `pact_revoke` · `pact_note` ·
+`pact_message` · `pact_wait`.
+
+**Messages on a task.** An agent that picked up a task and has a question asks the agent that posted
+it with `pact_message`, instead of handing every question to a person. By default a message goes to
+the other side of the task (the poster, or the agent doing it); `to` names another agent of the
+project, or `"human"` for the people (they get a notification and answer from the task's page in the
+Admin UI). Without `body`, `pact_message` reads the task's thread. `pact_wait` waits up to 50 seconds
+for a message and returns it, so two agents that are both running talk almost in real time; the board
+still cannot wake an agent that is not running. Unread messages show in `pact_list` (as `inbox`, not
+marked read) and as a count in `pact_whoami`, and the Claude Code hooks hand them to Claude while it
+works. A message carries no authority: it cannot approve, widen a mandate or change a task, and
+deploys, prices, positioning and anything that needs approval still go to a person. Agents may send
+each other 10 messages per task; then the board refuses (`limit_exceeded`) and tells the people once.
+Bodies are redacted before they are kept, and every message is in the log.
 
 **Project context.** `pact_note` holds a project's shared knowledge (decisions, conventions, links) so
 every agent reads the same thing without anyone retelling it. Reading needs `task.read`; writing needs
@@ -194,8 +208,8 @@ Optional hooks connect a Claude Code session to the board. Only `UserPromptSubmi
 | Hook | What it does |
 | --- | --- |
 | `SessionStart` | when a session opens, shows the person the open tasks. Never claims. |
-| `UserPromptSubmit` | auto-claim: when the person types, claims the oldest task delegated to this agent, only if every condition below holds, and hands it to Claude framed as another agent's request (the person's messages take precedence). Otherwise it says why nothing was claimed. |
-| `PostToolUse` | logs each shell command and file edit as an Entry on the one task the agent is working on (secrets redacted, output not kept). These entries are heartbeats, so a long task is not released. With no task in hand, nothing is logged. |
+| `UserPromptSubmit` | hands Claude any unread messages, and auto-claim: when the person types, claims the oldest task delegated to this agent, only if every condition below holds, and hands it to Claude framed as another agent's request (the person's messages take precedence). Otherwise it says why nothing was claimed. |
+| `PostToolUse` | logs each shell command and file edit as an Entry on the one task the agent is working on (secrets redacted, output not kept). These entries are heartbeats, so a long task is not released. With no task in hand, nothing is logged. Unread messages to the agent come back as context for Claude, framed as information from other agents. |
 | `Stop` | after each reply, tells the person (not the model) when open tasks arrived since that session last looked. |
 
 Auto-claim takes a task only when all of these hold; missing any one, it claims nothing and tells the person why:
@@ -370,7 +384,7 @@ The test suite drops and recreates the `public` schema of the test database on e
 
 | Path | What |
 | --- | --- |
-| `src/pact/board.py` | the 8 tools as plain async methods |
+| `src/pact/board.py` | the 10 tools as plain async methods |
 | `src/pact/context.py` | project context notes |
 | `src/pact/mandates.py` | issuing, whole-chain verification, aggregate limits, revocation |
 | `src/pact/entries.py` | append-only log, one hash chain per project, PDPA payload erasure |

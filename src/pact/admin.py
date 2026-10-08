@@ -31,6 +31,7 @@ from .entries import DEFAULT_ORG, EntryInput, append_entry, erase_payload, verif
 from .errors import PactError
 from .keys import b64url, b64url_decode, public_key_from_text
 from .mandates import MAX_DEPTH, ImportedLink, Limits, get_mandate, issue_root, revoke_impact, revoke_subtree
+from .redact import redact_text
 from .scope import board_scope, is_valid_scope
 
 Role = Literal["owner", "approver", "viewer"]
@@ -1306,6 +1307,42 @@ class Admin:
                 task_id=str(task["id"]),
             )
             return {"released_from": task["assignee"]}
+
+    async def send_message(self, task_id: str, *, by: str, body: str, to: str | None = None) -> dict[str, Any]:
+        """A person writes on a task's thread, to one of the project's agents: by default the one
+        doing it, else the one it is delegated to, else the agent that posted it. The agent sees it
+        on its next pact_list, pact_message or pact_wait, or through its Claude Code hook."""
+        text = redact_text(body.strip())
+        if not text or len(text) > 8000:
+            raise PactError("invalid_request", "a message is 1 to 8000 characters")
+        async with transaction(self.pool) as conn:
+            org = await self._require(conn, by, "approver")
+            task = await self._open_task(conn, task_id, org)
+            target = to or task["assignee"] or task["delegate_to"] or task["created_by"]
+            agent = await fetchone(
+                conn,
+                """SELECT a.id FROM agents a JOIN agent_projects ap ON ap.agent_id = a.id
+                   WHERE a.id = %s AND ap.project_id = %s AND a.status <> 'banned'""",
+                (target, task["project_id"]),
+            )
+            if agent is None:
+                raise PactError("agent_unknown", f"agent {target} is not registered in project {task['project_id']}")
+            row = await fetchone(
+                conn,
+                """INSERT INTO task_messages (org_id, task_id, from_human, to_agent, body)
+                   VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+                (org, task["id"], by, target, text),
+            )
+            assert row is not None
+            await self._log(
+                conn,
+                by,
+                "admin.task.message",
+                {"to": target, "body": text},
+                project_id=task["project_id"],
+                task_id=str(task["id"]),
+            )
+            return {"message_id": row["id"], "to": target}
 
     async def cancel_task(self, task_id: str, *, by: str, reason: str | None = None) -> dict[str, Any]:
         """Close a task nobody should do any more. Its delegated mandate dies with it, as with any close."""

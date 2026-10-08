@@ -52,7 +52,7 @@ async def test_owner_signs_in_and_is_pinned_by_sub(world: World, board: tuple[st
     aud = settings.resource("chat-boss")
     r = await call(url, "chat-boss", issuer.token("sub-boss", aud, email="BOSS@example.com"))
     assert r.status_code == 200, r.text
-    assert len(r.json()["result"]["tools"]) == 8
+    assert len(r.json()["result"]["tools"]) == 10
     async with transaction(world.pool) as conn:
         row = await fetchone(conn, "SELECT auth_sub FROM humans WHERE id = 'boss'")
     assert row == {"auth_sub": "sub-boss"}
