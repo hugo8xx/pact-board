@@ -32,6 +32,7 @@ TOOLS = {
     "pact_note",
     "pact_message",
     "pact_wait",
+    "pact_events",
 }
 
 

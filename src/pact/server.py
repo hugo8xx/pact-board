@@ -1,4 +1,4 @@
-"""MCP surface: the ten tools, served over Streamable HTTP at /mcp/a/<agent-id>.
+"""MCP surface: the eleven tools, served over Streamable HTTP at /mcp/a/<agent-id>.
 
 The ASGI wrapper resolves the caller from the URL and the bearer token before the MCP app sees
 the request; tools read that agent off the request. Agents never pass their own identity.
@@ -34,8 +34,10 @@ from .oauth import ResourceSettings, TokenRejected, Verifier, agent_for_oauth
 INSTRUCTIONS = """\
 PACT Board is the shared task board for this organization's agents. Every call carries a mandate: a chain
 of authority that traces back to a human. Rules:
-- Call pact_whoami at the start of a session, then pact_list. The board cannot push to you:
-  pact_list is the only way to learn about new work. Call it again after finishing each task.
+- Call pact_whoami at the start of a session, then pact_list. Call pact_list again after finishing
+  each task. A program that keeps running (a Runner) can hold pact_events open instead of polling:
+  it answers as soon as there is work or a message for you. The board cannot start an agent that
+  is not running.
 - Claim (pact_claim) before you start any task. If you get already_claimed, move on quietly.
 - While working, call pact_report with status "working" at least every 20 minutes, or the
   board releases your claim after 30 minutes and someone else may take the task.
@@ -113,8 +115,8 @@ def build_mcp(board: Board) -> MCPServer:
         ] = None,
     ) -> dict[str, Any]:
         """Put a task on the board. With delegate_to, only that agent may claim it and it receives a
-        narrower mandate of its own. The task starts only when the receiving agent next calls
-        pact_list — tell the user so."""
+        narrower mandate of its own. The task starts only when the receiving agent next pulls work
+        (at once if its Runner waits on pact_events) — tell the user so."""
         return await _guard(
             board.post(
                 _agent(ctx),
@@ -148,8 +150,8 @@ def build_mcp(board: Board) -> MCPServer:
             str | None, Field(description="Only the subtasks of this task, e.g. with filter=all to see how they went.")
         ] = None,
     ) -> dict[str, Any]:
-        """The only way to learn about work: the board cannot push. Call at the start of a session
-        and after finishing each task. Deferred tasks come back in their own list for humans."""
+        """The work on the board. Call at the start of a session and after finishing each task (or
+        when pact_events wakes you). Deferred tasks come back in their own list for humans."""
         return await _guard(
             board.list_tasks(
                 _agent(ctx),
@@ -294,6 +296,29 @@ def build_mcp(board: Board) -> MCPServer:
         while it is running; if it is not, carry on or ask a person."""
         return await _guard(board.wait(_agent(ctx), mandate_id=mandate_id, seconds=seconds, task_id=task_id))
 
+    @mcp.tool(title="Wait for work")
+    async def pact_events(
+        ctx: Context,
+        mandate_id: MandateId,
+        since: Annotated[
+            int | None,
+            Field(description="next_since from your previous pact_events or pact_list; events after it come back."),
+        ] = None,
+        seconds: Annotated[float, Field(description="How long to wait, at most 50.")] = 50,
+        project_id: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """For a program that keeps running (a Runner): wait until something needs you, then return
+        it. Events are tasks you may claim now (delegated to you, open, or resumed by a person) and
+        unread messages to you, each with a seq after since. Returns at once when there are some;
+        after seconds with none, timed_out and the same next_since. Pass next_since back every
+        time so nothing is missed after a dropped call. Nothing is claimed or marked read."""
+        return await _guard(
+            board.wait_events(
+                _agent(ctx), mandate_id=mandate_id, since=since, seconds=seconds, project_id=project_id, limit=limit
+            )
+        )
+
     async def _read(ctx: Context, project_id: str, key: str | None) -> str:
         agent = _agent(ctx)
         try:
@@ -350,13 +375,15 @@ class PactApp:
     hosted Claude apps). An OAuth caller must be the owner of the agent in the URL.
     """
 
-    def __init__(self, pool: AsyncConnectionPool[Conn], mcp_app: ASGIApp, settings: ResourceSettings) -> None:
+    def __init__(
+        self, pool: AsyncConnectionPool[Conn], mcp_app: ASGIApp, settings: ResourceSettings, board: Board | None = None
+    ) -> None:
         self.pool = pool
         self.mcp_app = mcp_app
         self.settings = settings
         self.verifier = Verifier(settings)
         self.admin_app = build_admin_app(pool, self.verifier)
-        self.board = Board(pool)
+        self.board = board or Board(pool)
         self.sender = SlackSender.from_env(pool)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -509,6 +536,7 @@ class PactApp:
             if message["type"] == "lifespan.shutdown.complete":
                 if self.sender:
                     await self.sender.stop()
+                await self.board.close()
                 await self.pool.close()
             await send(message)
 
@@ -534,7 +562,8 @@ async def _respond(send: Send, status: int, body: dict[str, Any], extra_headers:
 def create_app(pool: AsyncConnectionPool[Conn] | None = None, settings: ResourceSettings | None = None) -> PactApp:
     pool = pool or create_pool()
     settings = settings or ResourceSettings.from_env()
-    mcp = build_mcp(Board(pool))
+    board = Board(pool)  # one per process: the MCP tools and the hooks share its event listener
+    mcp = build_mcp(board)
     host = urlsplit(settings.public_url).netloc
     security = None
     if settings.public_url.startswith("https://"):
@@ -543,4 +572,4 @@ def create_app(pool: AsyncConnectionPool[Conn] | None = None, settings: Resource
             enable_dns_rebinding_protection=True, allowed_hosts=[host], allowed_origins=[f"https://{host}", "https://claude.ai"]
         )
     mcp_app = mcp.streamable_http_app(stateless_http=True, json_response=True, transport_security=security)
-    return PactApp(pool, mcp_app, settings)
+    return PactApp(pool, mcp_app, settings, board)

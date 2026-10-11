@@ -103,5 +103,7 @@ async def world() -> AsyncIterator[World]:
         await conn.execute("UPDATE orgs SET halted = false")
     admin = Admin(pool)
     await admin.add_human("boss", "Boss", "owner")
-    yield World(pool=pool, admin=admin, board=Board(pool))
+    world = World(pool=pool, admin=admin, board=Board(pool))
+    yield world
+    await world.board.close()
     await pool.close()
