@@ -23,7 +23,7 @@ from starlette.routing import Route
 from . import context as notes
 from . import credentials
 from .admin import Admin
-from .board import TERMINAL_STATUSES, export_format
+from .board import ONLINE_GRACE_SECONDS, TERMINAL_STATUSES, export_format
 from .db import Conn, fetchall, fetchone, transaction
 from .errors import PactError
 from .oauth import TokenRejected, Verifier, sign_in
@@ -252,7 +252,9 @@ class AdminApi:
             return await fetchall(
                 conn,
                 """SELECT a.id, a.owner, a.client, a.status, a.last_seen, a.created_at, a.root_mandate_id, a.preferences,
-                          a.role_id, a.replaced_by,
+                          a.role_id, a.replaced_by, a.listening_until,
+                          -- Ready for work now: holding pact_events open, or between two waits.
+                          coalesce(a.listening_until > now() - make_interval(secs => %s), false) AS online,
                           coalesce(array_agg(ap.project_id ORDER BY ap.project_id)
                                    FILTER (WHERE ap.project_id IS NOT NULL), '{}') AS projects,
                           (SELECT count(*) FROM agent_tokens t
@@ -263,7 +265,7 @@ class AdminApi:
                    FROM agents a LEFT JOIN agent_projects ap ON ap.agent_id = a.id
                    WHERE a.org_id = %s
                    GROUP BY a.id ORDER BY a.id""",
-                (actor.org,),
+                (ONLINE_GRACE_SECONDS, actor.org),
             )
 
     async def agent_connection(self, request: Request, actor: Actor) -> Any:
