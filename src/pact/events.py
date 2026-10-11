@@ -35,10 +35,12 @@ class Subscription:
 
     async def wait(self, seconds: float) -> None:
         """Until a change in the organization, the re-read interval, or ``seconds``, whichever is first."""
-        self.event.clear()
         timeout = max(0.0, min(seconds, self.hub.recheck_seconds()))
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self.event.wait(), timeout)
+        # Cleared after waking, not before: a change that landed during the caller's read has
+        # already set the event, and must end this wait at once.
+        self.event.clear()
 
 
 class EventHub:
